@@ -1,0 +1,39 @@
+# Build directories
+build/
+bin/
+lib/
+out/
+dist/
+
+# Visual Studio & IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+CMakeSettings.json
+
+# Compiler & Linker outputs
+*.obj
+*.ilk
+*.pdb
+*.tlog
+*.idb
+*.ipch
+*.pch
+*.res
+*.exe
+*.dll
+*.lib
+
+# Logs & temp files
+*.log
+*.tmp
+*.bak
+scratch/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
