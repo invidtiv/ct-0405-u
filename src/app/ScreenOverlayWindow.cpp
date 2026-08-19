@@ -3,11 +3,48 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
 
 namespace ct0405 {
 
 constexpr int HANDLE_RADIUS = 7;
 constexpr int HANDLE_TOUCH = 14;
+
+// Helper to format aspect ratios nicely (e.g. 4:3, 16:9, etc.)
+static std::wstring FormatAspectRatio(double w, double h) {
+    if (h <= 0.001 || w <= 0.001) return L"N/A";
+    double ratio = w / h;
+    std::wostringstream ss;
+    ss << std::fixed << std::setprecision(2) << ratio << L":1";
+
+    if (std::abs(ratio - (4.0 / 3.0)) < 0.025) {
+        ss << L" (4:3)";
+    } else if (std::abs(ratio - (16.0 / 9.0)) < 0.025) {
+        ss << L" (16:9)";
+    } else if (std::abs(ratio - (16.0 / 10.0)) < 0.025) {
+        ss << L" (16:10)";
+    } else if (std::abs(ratio - (21.0 / 9.0)) < 0.035) {
+        ss << L" (21:9)";
+    } else if (std::abs(ratio - (3.0 / 2.0)) < 0.025) {
+        ss << L" (3:2)";
+    } else if (std::abs(ratio - 1.0) < 0.02) {
+        ss << L" (1:1)";
+    } else if (std::abs(ratio - (5.0 / 4.0)) < 0.025) {
+        ss << L" (5:4)";
+    }
+    return ss.str();
+}
+
+static void AddRoundedRectangle(Gdiplus::GraphicsPath& path, float x, float y, float w, float h, float radius) {
+    float d = radius * 2.0f;
+    if (d > w) d = w;
+    if (d > h) d = h;
+    path.AddArc(x, y, d, d, 180, 90);
+    path.AddArc(x + w - d, y, d, d, 270, 90);
+    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+    path.AddArc(x, y + h - d, d, d, 90, 90);
+    path.CloseFigure();
+}
 
 ScreenOverlayWindow::ScreenOverlayWindow() {}
 
@@ -15,10 +52,13 @@ ScreenOverlayWindow::~ScreenOverlayWindow() {
     Close();
 }
 
-bool ScreenOverlayWindow::Show(HINSTANCE hInstance, HWND hParent, const RECT& initial_rect, double tablet_aspect, ApplyCallback on_apply) {
+bool ScreenOverlayWindow::Show(HINSTANCE hInstance, HWND hParent, const RECT& initial_rect, double tablet_aspect, uint32_t tablet_w, uint32_t tablet_h, ApplyCallback on_apply) {
     m_hParent = hParent;
     m_on_apply = on_apply;
     m_tablet_aspect = (tablet_aspect > 0.1) ? tablet_aspect : (4.0 / 3.0);
+    m_tablet_w = (tablet_w > 100) ? tablet_w : 5040;
+    m_tablet_h = (tablet_h > 100) ? tablet_h : 3780;
+    m_lock_aspect = true;
 
     const wchar_t CLASS_NAME[] = L"CT0405_ScreenOverlay_Class";
 
@@ -252,11 +292,15 @@ LRESULT ScreenOverlayWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lPar
                         newRect.bottom += dy;
                     }
 
-                    // Enforce min size
+                    // Enforce minimum size
                     if (newRect.right - newRect.left < 80) newRect.right = newRect.left + 80;
                     if (newRect.bottom - newRect.top < 60) newRect.bottom = newRect.top + 60;
 
-                    ConstrainToAspectRatio(newRect, m_active_hit);
+                    // Moving/resizing with SHIFT held allows FREEFORM mode (does NOT follow tablet aspect ratio)
+                    bool shiftHeld = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                    if (!shiftHeld && m_lock_aspect) {
+                        ConstrainToAspectRatio(newRect, m_active_hit);
+                    }
                 }
 
                 m_selection_rect = newRect;
@@ -295,6 +339,7 @@ LRESULT ScreenOverlayWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lPar
                 int cx = (primary.right - w) / 2;
                 int cy = (primary.bottom - h) / 2;
                 m_selection_rect = { cx, cy, cx + w, cy + h };
+                m_lock_aspect = true;
                 InvalidateRect(m_hWnd, nullptr, FALSE);
                 return 0;
             }
@@ -333,29 +378,54 @@ LRESULT ScreenOverlayWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lPar
                 Close();
             } else if (wParam == VK_ESCAPE) {
                 Close();
+            } else if (wParam == 'M' || wParam == 'm') {
+                // Quick shortcut to match tablet aspect ratio
+                int w = m_selection_rect.right - m_selection_rect.left;
+                int h = static_cast<int>(w / m_tablet_aspect);
+                m_selection_rect.bottom = m_selection_rect.top + h;
+                m_lock_aspect = true;
+                InvalidateRect(m_hWnd, nullptr, FALSE);
+            } else if (wParam == 'P' || wParam == 'p') {
+                // Quick shortcut to fit primary monitor
+                RECT primary{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+                int w = primary.right - primary.left;
+                int h = static_cast<int>(w / m_tablet_aspect);
+                if (h > primary.bottom) {
+                    h = primary.bottom;
+                    w = static_cast<int>(h * m_tablet_aspect);
+                }
+                int cx = (primary.right - w) / 2;
+                int cy = (primary.bottom - h) / 2;
+                m_selection_rect = { cx, cy, cx + w, cy + h };
+                m_lock_aspect = true;
+                InvalidateRect(m_hWnd, nullptr, FALSE);
             } else if (wParam == VK_LEFT) {
-                int shift = (GetKeyState(VK_SHIFT) & 0x8000) ? 20 : 2;
+                int shift = (GetKeyState(VK_CONTROL) & 0x8000) ? 20 : 2;
                 m_selection_rect.left -= shift;
                 m_selection_rect.right -= shift;
                 InvalidateRect(m_hWnd, nullptr, FALSE);
             } else if (wParam == VK_RIGHT) {
-                int shift = (GetKeyState(VK_SHIFT) & 0x8000) ? 20 : 2;
+                int shift = (GetKeyState(VK_CONTROL) & 0x8000) ? 20 : 2;
                 m_selection_rect.left += shift;
                 m_selection_rect.right += shift;
                 InvalidateRect(m_hWnd, nullptr, FALSE);
             } else if (wParam == VK_UP) {
-                int shift = (GetKeyState(VK_SHIFT) & 0x8000) ? 20 : 2;
+                int shift = (GetKeyState(VK_CONTROL) & 0x8000) ? 20 : 2;
                 m_selection_rect.top -= shift;
                 m_selection_rect.bottom -= shift;
                 InvalidateRect(m_hWnd, nullptr, FALSE);
             } else if (wParam == VK_DOWN) {
-                int shift = (GetKeyState(VK_SHIFT) & 0x8000) ? 20 : 2;
+                int shift = (GetKeyState(VK_CONTROL) & 0x8000) ? 20 : 2;
                 m_selection_rect.top += shift;
                 m_selection_rect.bottom += shift;
                 InvalidateRect(m_hWnd, nullptr, FALSE);
             }
             return 0;
         }
+
+        case WM_KEYUP:
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+            return 0;
 
         case WM_PAINT: {
             PAINTSTRUCT ps;
@@ -393,26 +463,31 @@ void ScreenOverlayWindow::OnPaint(HDC hdc) {
     float sw = static_cast<float>(m_selection_rect.right - m_selection_rect.left);
     float sh = static_cast<float>(m_selection_rect.bottom - m_selection_rect.top);
 
-    // Transparent interior with slight cyan tint
-    Gdiplus::SolidBrush fillBrush(Gdiplus::Color(25, 76, 201, 240));
+    double current_aspect = (sh > 0.0) ? (static_cast<double>(sw) / static_cast<double>(sh)) : 1.0;
+    bool is_matched = std::abs(current_aspect - m_tablet_aspect) < 0.03;
+    bool shift_held = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+    // Interior tint color
+    Gdiplus::Color themeCol = is_matched ? Gdiplus::Color(255, 76, 201, 240) : (shift_held ? Gdiplus::Color(255, 255, 170, 0) : Gdiplus::Color(255, 255, 107, 129));
+    Gdiplus::SolidBrush fillBrush(Gdiplus::Color(25, themeCol.GetR(), themeCol.GetG(), themeCol.GetB()));
     g.FillRectangle(&fillBrush, sx, sy, sw, sh);
 
     // Outer glow & main border
-    Gdiplus::Pen glowPen(Gdiplus::Color(90, 76, 201, 240), 4.0f);
+    Gdiplus::Pen glowPen(Gdiplus::Color(90, themeCol.GetR(), themeCol.GetG(), themeCol.GetB()), 4.0f);
     g.DrawRectangle(&glowPen, sx - 1.0f, sy - 1.0f, sw + 2.0f, sh + 2.0f);
 
-    Gdiplus::Pen borderPen(Gdiplus::Color(255, 76, 201, 240), 2.0f);
+    Gdiplus::Pen borderPen(themeCol, 2.0f);
     g.DrawRectangle(&borderPen, sx, sy, sw, sh);
 
     // Inner Grid / Crosshair
-    Gdiplus::Pen gridPen(Gdiplus::Color(50, 76, 201, 240), 1.0f);
+    Gdiplus::Pen gridPen(Gdiplus::Color(50, themeCol.GetR(), themeCol.GetG(), themeCol.GetB()), 1.0f);
     g.DrawLine(&gridPen, sx + sw / 2.0f, sy, sx + sw / 2.0f, sy + sh);
     g.DrawLine(&gridPen, sx, sy + sh / 2.0f, sx + sw, sy + sh / 2.0f);
 
     // Handles
     auto draw_handle = [&](float x, float y) {
         Gdiplus::SolidBrush hBrush(Gdiplus::Color(255, 255, 255, 255));
-        Gdiplus::Pen hPen(Gdiplus::Color(255, 76, 201, 240), 2.0f);
+        Gdiplus::Pen hPen(themeCol, 2.0f);
         g.FillEllipse(&hBrush, x - HANDLE_RADIUS, y - HANDLE_RADIUS, HANDLE_RADIUS * 2.0f, HANDLE_RADIUS * 2.0f);
         g.DrawEllipse(&hPen, x - HANDLE_RADIUS, y - HANDLE_RADIUS, HANDLE_RADIUS * 2.0f, HANDLE_RADIUS * 2.0f);
     };
@@ -427,37 +502,56 @@ void ScreenOverlayWindow::OnPaint(HDC hdc) {
     draw_handle(sx + sw, sy + sh / 2.0f);
 
     // Top Floating Toolbar Banner
-    float tbX = (width - 760) / 2.0f;
-    float tbY = 30.0f;
-    float tbW = 760.0f;
-    float tbH = 68.0f;
+    float tbW = 860.0f;
+    float tbH = 74.0f;
+    float tbX = (static_cast<float>(width) - tbW) / 2.0f;
+    float tbY = 24.0f;
 
-    Gdiplus::SolidBrush tbBg(Gdiplus::Color(245, 24, 26, 32));
-    Gdiplus::Pen tbBorder(Gdiplus::Color(255, 76, 201, 240), 1.5f);
-    g.FillRectangle(&tbBg, tbX, tbY, tbW, tbH);
-    g.DrawRectangle(&tbBorder, tbX, tbY, tbW, tbH);
+    Gdiplus::GraphicsPath tbPath;
+    AddRoundedRectangle(tbPath, tbX, tbY, tbW, tbH, 8.0f);
 
-    Gdiplus::Font titleFont(L"Segoe UI", 10.0f, Gdiplus::FontStyleBold);
+    Gdiplus::SolidBrush tbBg(Gdiplus::Color(245, 20, 23, 31));
+    Gdiplus::Pen tbBorder(Gdiplus::Color(255, 50, 60, 80), 1.2f);
+    g.FillPath(&tbBg, &tbPath);
+    g.DrawPath(&tbBorder, &tbPath);
+
+    Gdiplus::Font titleFont(L"Segoe UI", 10.5f, Gdiplus::FontStyleBold);
     Gdiplus::Font subFont(L"Segoe UI", 8.5f, Gdiplus::FontStyleRegular);
-    Gdiplus::Font btnFont(L"Segoe UI", 9.0f, Gdiplus::FontStyleBold);
+    Gdiplus::Font btnFont(L"Segoe UI", 8.5f, Gdiplus::FontStyleBold);
 
-    Gdiplus::SolidBrush textBrush(Gdiplus::Color(255, 240, 245, 255));
-    Gdiplus::SolidBrush subBrush(Gdiplus::Color(255, 170, 180, 200));
+    Gdiplus::SolidBrush textBrush(Gdiplus::Color(255, 255, 255, 255));
+    Gdiplus::SolidBrush subBrush(Gdiplus::Color(255, 180, 190, 210));
+    Gdiplus::SolidBrush cyanBrush(Gdiplus::Color(255, 76, 201, 240));
+    Gdiplus::SolidBrush greenBrush(Gdiplus::Color(255, 6, 214, 160));
+    Gdiplus::SolidBrush amberBrush(Gdiplus::Color(255, 255, 170, 0));
 
     g.DrawString(L"INTERACTIVE TABLET SCREEN MAPPING OVERLAY", -1, &titleFont, Gdiplus::PointF(tbX + 18.0f, tbY + 10.0f), &textBrush);
 
+    // Format Overlay Aspect Ratio vs Calibrated Tablet Aspect Ratio
+    std::wstring overlayRatioStr = FormatAspectRatio(sw, sh);
+    std::wstring tabletRatioStr = FormatAspectRatio(m_tablet_w, m_tablet_h);
+
     std::wostringstream ssInfo;
-    ssInfo << L"Mapped Area: " << static_cast<int>(sw) << L" x " << static_cast<int>(sh)
-           << L" px | Pos: (" << static_cast<int>(sx) << L", " << static_cast<int>(sy) << L")"
-           << L" | Tablet Ratio: " << std::fixed << std::setprecision(2) << m_tablet_aspect << L":1";
-    g.DrawString(ssInfo.str().c_str(), -1, &subFont, Gdiplus::PointF(tbX + 18.0f, tbY + 36.0f), &subBrush);
+    ssInfo << L"Overlay: " << static_cast<int>(sw) << L"x" << static_cast<int>(sh) << L" (" << overlayRatioStr << L")  |  "
+           << L"Calibrated Tablet: " << m_tablet_w << L"x" << m_tablet_h << L" (" << tabletRatioStr << L")  |  "
+           << (is_matched ? L"[✓ 1:1 Matched]" : (shift_held ? L"[⚠️ Freeform (Shift Active)]" : L"[≠ Freeform Ratio]"));
+
+    g.DrawString(ssInfo.str().c_str(), -1, &subFont, Gdiplus::PointF(tbX + 18.0f, tbY + 36.0f), is_matched ? &greenBrush : (shift_held ? &amberBrush : &cyanBrush));
+
+    // Helper tip line
+    Gdiplus::Font tipFont(L"Segoe UI", 7.5f, Gdiplus::FontStyleRegular);
+    Gdiplus::SolidBrush tipBrush(Gdiplus::Color(255, 140, 150, 170));
+    g.DrawString(L"Tip: Hold SHIFT while dragging handles to resize freely without locking aspect ratio.", -1, &tipFont, Gdiplus::PointF(tbX + 18.0f, tbY + 54.0f), &tipBrush);
 
     // Toolbar action buttons
-    auto draw_btn = [&](float bx, float by, float bw, float bh, const wchar_t* text, Gdiplus::Color bgColor, Gdiplus::Color textColor, RECT& out_rect) {
+    auto draw_btn = [&](float bx, float by, float bw, float bh, const wchar_t* text, Gdiplus::Color bgColor, Gdiplus::Color textColor, Gdiplus::Color borderCol, RECT& out_rect) {
+        Gdiplus::GraphicsPath bPath;
+        AddRoundedRectangle(bPath, bx, by, bw, bh, 4.0f);
+
         Gdiplus::SolidBrush bBrush(bgColor);
-        Gdiplus::Pen bPen(textColor, 1.0f);
-        g.FillRectangle(&bBrush, bx, by, bw, bh);
-        g.DrawRectangle(&bPen, bx, by, bw, bh);
+        Gdiplus::Pen bPen(borderCol, 1.0f);
+        g.FillPath(&bBrush, &bPath);
+        g.DrawPath(&bPen, &bPath);
 
         Gdiplus::SolidBrush tBrush(textColor);
         Gdiplus::StringFormat sf;
@@ -469,27 +563,32 @@ void ScreenOverlayWindow::OnPaint(HDC hdc) {
     };
 
     float btnY = tbY + 18.0f;
-    draw_btn(tbX + tbW - 320.0f, btnY, 145.0f, 32.0f, L"Apply [Enter]", Gdiplus::Color(255, 6, 214, 160), Gdiplus::Color(255, 20, 25, 30), m_btn_apply_rect);
-    draw_btn(tbX + tbW - 165.0f, btnY, 145.0f, 32.0f, L"Cancel [Esc]", Gdiplus::Color(255, 45, 48, 58), Gdiplus::Color(255, 240, 240, 240), m_btn_cancel_rect);
+    draw_btn(tbX + tbW - 365.0f, btnY, 115.0f, 32.0f, L"Match Ratio [M]", Gdiplus::Color(255, 35, 40, 55), Gdiplus::Color(255, 76, 201, 240), Gdiplus::Color(255, 76, 201, 240), m_btn_ratio_rect);
+    draw_btn(tbX + tbW - 240.0f, btnY, 115.0f, 32.0f, L"Apply [Enter]", Gdiplus::Color(255, 31, 111, 235), Gdiplus::Color(255, 255, 255, 255), Gdiplus::Color(255, 88, 166, 255), m_btn_apply_rect);
+    draw_btn(tbX + tbW - 115.0f, btnY, 100.0f, 32.0f, L"Cancel [Esc]", Gdiplus::Color(255, 35, 40, 52), Gdiplus::Color(255, 220, 225, 235), Gdiplus::Color(255, 70, 78, 98), m_btn_cancel_rect);
 
-    // Selection Size Floating Badge
-    float badgeW = 200.0f;
-    float badgeH = 26.0f;
+    // Selection Size & Ratio Floating Badge
+    float badgeW = 370.0f;
+    float badgeH = 30.0f;
     float badgeX = sx + (sw - badgeW) / 2.0f;
     float badgeY = sy + sh + 10.0f;
-    if (badgeY + badgeH > height - 10) badgeY = sy - badgeH - 10.0f;
+    if (badgeY + badgeH > static_cast<float>(height) - 10.0f) badgeY = sy - badgeH - 10.0f;
 
-    Gdiplus::SolidBrush badgeBg(Gdiplus::Color(230, 20, 22, 28));
-    Gdiplus::Pen badgeBorder(Gdiplus::Color(255, 76, 201, 240), 1.0f);
-    g.FillRectangle(&badgeBg, badgeX, badgeY, badgeW, badgeH);
-    g.DrawRectangle(&badgeBorder, badgeX, badgeY, badgeW, badgeH);
+    Gdiplus::GraphicsPath badgePath;
+    AddRoundedRectangle(badgePath, badgeX, badgeY, badgeW, badgeH, 15.0f);
+
+    Gdiplus::SolidBrush badgeBg(Gdiplus::Color(235, 18, 21, 28));
+    Gdiplus::Pen badgeBorder(themeCol, 1.0f);
+    g.FillPath(&badgeBg, &badgePath);
+    g.DrawPath(&badgeBorder, &badgePath);
 
     std::wostringstream ssBadge;
-    ssBadge << static_cast<int>(sw) << L" x " << static_cast<int>(sh) << L" (Double-click to apply)";
+    ssBadge << static_cast<int>(sw) << L"x" << static_cast<int>(sh) << L"  |  "
+            << L"Overlay: " << overlayRatioStr << L"  |  Tablet: " << tabletRatioStr;
     Gdiplus::StringFormat sfBadge;
     sfBadge.SetAlignment(Gdiplus::StringAlignmentCenter);
     sfBadge.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    Gdiplus::SolidBrush badgeTxt(Gdiplus::Color(255, 76, 201, 240));
+    Gdiplus::SolidBrush badgeTxt(themeCol);
     g.DrawString(ssBadge.str().c_str(), -1, &subFont, Gdiplus::RectF(badgeX, badgeY, badgeW, badgeH), &sfBadge, &badgeTxt);
 
     BitBlt(hdc, 0, 0, width, height, hdcMem, 0, 0, SRCCOPY);

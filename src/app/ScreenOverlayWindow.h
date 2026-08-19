@@ -32,7 +32,7 @@ public:
     ScreenOverlayWindow();
     ~ScreenOverlayWindow();
 
-    bool Show(HINSTANCE hInstance, HWND hParent, const RECT& initial_rect, double tablet_aspect, ApplyCallback on_apply);
+    bool Show(HINSTANCE hInstance, HWND hParent, const RECT& initial_rect, double tablet_aspect, uint32_t tablet_w, uint32_t tablet_h, ApplyCallback on_apply);
     void Close();
 
 private:
@@ -51,6 +51,8 @@ private:
     RECT m_virtual_rect{ 0, 0, 1920, 1080 };
     RECT m_selection_rect{ 200, 200, 1200, 950 };
     double m_tablet_aspect = 4.0 / 3.0;
+    uint32_t m_tablet_w = 5040;
+    uint32_t m_tablet_h = 3780;
     bool m_lock_aspect = true;
 
     // Mouse Interaction

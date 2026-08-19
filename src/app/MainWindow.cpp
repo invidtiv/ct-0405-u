@@ -637,7 +637,7 @@ void MainWindow::OpenScreenAreaOverlay() {
         tablet_aspect = static_cast<double>(c.tablet_max_x) / static_cast<double>(c.tablet_max_y);
     }
 
-    m_overlay.Show(m_hInstance, m_hWnd, c.custom_screen_rect, tablet_aspect, [this](const RECT& selected_rect) {
+    m_overlay.Show(m_hInstance, m_hWnd, c.custom_screen_rect, tablet_aspect, c.tablet_max_x, c.tablet_max_y, [this](const RECT& selected_rect) {
         DriverConfig cfg = m_driver.GetConfig();
         cfg.mapping_mode = MappingMode::CustomArea;
         cfg.custom_screen_rect = selected_rect;
