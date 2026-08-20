@@ -1,6 +1,6 @@
 # Wacom CT-0405-U Custom Windows Driver & Control Panel
 
-A modern, high-performance, standalone Windows driver, background service, and graphical control panel for the **Wacom CT-0405-U** (Wacom PenPartner) and legacy Graphire series USB graphics tablets on **64-bit Windows 10 and Windows 11**.
+A modern, high-performance, standalone Windows driver, background service, and graphical control panel for the **Wacom CT-0405-U** (Wacom PenPartner) USB graphics tablet on **64-bit Windows 10 and Windows 11**.
 
 > **Engineered & Developed by Antigravity powered by Gemini 3.7 Flash** (Google DeepMind).
 
@@ -8,7 +8,7 @@ A modern, high-performance, standalone Windows driver, background service, and g
 
 ## Background & Motivation
 
-The **Wacom CT-0405-U** (and its siblings like the Graphire ET-0405-U) are iconic, durable USB digitizer tablets. However, official support ended more than 15 years ago. On modern 64-bit Windows (Windows 10/11):
+The **Wacom CT-0405-U** (Wacom PenPartner) is an iconic, durable USB digitizer tablet. However, official support ended more than 15 years ago. On modern 64-bit Windows (Windows 10/11):
 - Official legacy Wacom drivers fail to install or crash due to 64-bit kernel signature enforcement.
 - They lack modern **Windows Ink API** support, preventing pressure sensitivity in modern creative and note-taking apps (Photoshop, Clip Studio Paint, Krita, OneNote, Windows Whiteboard, MS Paint).
 - Modern multi-monitor and ultra-wide setups cause severe aspect-ratio distortion (circles drawn on the tablet become squished ovals on 16:9/21:9 monitors).
@@ -22,10 +22,21 @@ This project restores the tablet to full working order with sub-millisecond late
 | Model Name | Model Code | USB VID | USB PID | Active Area (X x Y) | Pressure Levels |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Wacom PenPartner USB** | **CT-0405-U** | `0x056A` | `0x0000` / `0x0003` | 5040 x 3780 | 256 levels (8-bit) |
-| **Wacom Graphire 1** | **CT-0405** | `0x056A` | `0x0010` | 10206 x 7422 | 512 levels (9-bit) |
-| **Wacom Graphire 2** | **ET-0405-U** | `0x056A` | `0x0011` | 10206 x 7422 | 512 levels (9-bit) |
-| **Wacom Graphire 3 / 4** | CTE-430 / CTE-440 | `0x056A` | `0x0013` / `0x0015` | 13918 x 10206 | 512 levels (9-bit) |
-| **Wacom Volito 1 / 2** | FT-0405-U | `0x056A` | `0x0060` / `0x0061` | 5104 x 3712 | 512 levels (9-bit) |
+
+This driver targets **one device family and decodes one report protocol**, verified
+against real CT-0405-U hardware.
+
+### Not supported
+
+Graphire (1/2/3/4) and Volito tablets share the same USB vendor ID but use a
+**different report layout** that this driver does not decode and that has never been
+tested here. They are recognised by product ID purely so the app can tell you what is
+plugged in and that it will not be driven — rather than misreading their packets as
+PenPartner data and flinging the cursor around. Plug one in and the control panel
+names it and reports it as unsupported.
+
+If you want to add support for one, `CT0405_CLI.exe --dump-packets` captures the raw
+bytes you would need.
 
 ---
 
@@ -49,9 +60,10 @@ This project restores the tablet to full working order with sub-millisecond late
 - Touch the top-left corner, then the bottom-right corner of the tablet surface with the pen tip.
 - The driver captures the exact hardware minimum and maximum coordinates.
 
-### 4. User-Definable Tablet Space & Resolution
-- Choose from standard presets (PenPartner 5040x3780, Graphire 10206x7422, Volito, etc.) or enter custom `Max X` and `Max Y` dimensions.
-- **Auto-Expand Bounds:** Automatically expands coordinates if higher hardware values are detected.
+### 4. Automatic & User-Definable Tablet Space
+- **Automatic detection:** the tablet's coordinate bounds are adopted on connect, so mapping is correct with no manual setup.
+- Use the stock CT-0405-U bounds (5040 x 3780), or enter your own `Max X` and `Max Y`. Typing bounds or running the corner calibration marks them as user-set, so automatic detection will not overwrite them. **Reset Bounds** hands control back to detection.
+- **Auto-Expand Bounds:** raises the active bounds when the hardware reports coordinates beyond the current ceiling.
 
 ### 5. Native Windows Ink (Synthetic Pen Pointer Injection)
 - Uses Windows `CreateSyntheticPointerDevice` and `InjectSyntheticPointerInput` API (`POINTER_TYPE_PEN`) for native pressure sensitivity and eraser tool switching in all modern Windows applications.
@@ -61,16 +73,24 @@ This project restores the tablet to full working order with sub-millisecond late
 - Eliminates sensor jitter when drawing fine lines or moving slowly while preserving zero lag during fast strokes.
 
 ### 7. Customizable Pressure Curves & Deadzones
-- Select from Linear, Soft, Very Soft, Firm, Hard, or Custom Bézier curves with real-time visual graph preview and adjustable initial deadzone thresholds.
+- Select from Linear, Soft, Very Soft, Firm, Hard, or Custom Bézier curves with a real-time graph preview. The live marker plots the actual operating point: pressure going in on the X axis, curve output on the Y axis.
+- The **deadzone** suppresses the click as well as the pressure value, so light resting contact does not register as a stroke.
+
+### 7b. Configurable Pen Tip & Barrel Buttons
+- The pen tip and both barrel buttons can each be set to: Default (native pen barrel), Left/Right/Middle Click, Eraser Toggle, Undo (Ctrl+Z), Redo (Ctrl+Y), Pan / Scroll Drag, or Disabled.
+- Assignments apply in both Windows Ink and mouse-emulation modes.
 
 ### 8. Background Service & System Tray
 - Custom high-DPI application icon with neon-cyan tablet and stylus theme.
-- **Close-to-Tray:** Clicking `[X]`, pressing `Alt+F4`, or clicking minimize hides the window to the notification area (system tray), keeping the driver actively running in the background.
-- **Exit Application:** Right-click the notification tray icon and choose **"Exit Driver"** to cleanly terminate the process.
+- **Close to Tray** (checkbox, on by default): clicking `[X]`, pressing `Alt+F4`, or minimizing hides the window to the notification area and keeps the driver running. Turn it **off** and the close button exits the application normally.
+- **Exit Application:** right-click the notification tray icon and choose **"Exit Driver"** to cleanly terminate the process.
+- **Multi-monitor aware:** the driver re-reads the display layout when monitors are added, removed, or rearranged.
 
 ### 9. Automatic Settings Persistence
-- All settings, custom resolutions, overlay rectangles, and calibration bounds are automatically saved to `%APPDATA%\CT0405_Driver\config.json`.
-- Settings persist across application launches, restarts, and system reboots.
+- All settings, custom resolutions, overlay rectangles, and calibration bounds are saved to `%APPDATA%\CT0405_Driver\config.json`.
+- **Portable mode:** place a `config.json` next to the executable and that file is used instead. The location is resolved from the executable's own directory, so it does not change when the app is started by Windows autostart.
+- Settings are applied to the running driver immediately and written to disk shortly after you stop adjusting them, so dragging a slider does not thrash the file.
+- Writes are atomic (write-then-rename); a failed save is reported rather than silently discarded.
 
 ---
 
@@ -145,18 +165,42 @@ Launch the control panel:
 
 ### CLI Diagnostics & Packet Sniffing
 ```cmd
-# Run hardware detection
+# Enumerate HID collections and show how the driver ranks tablet candidates
 .\build\bin\Release\CT0405_CLI.exe --diagnose
 
-# Sniff and inspect live packet bytes from the tablet
-.\build\bin\Release\CT0405_CLI.exe --dump-packets
+# Sniff live packet bytes from the tablet (optional duration in seconds)
+.\build\bin\Release\CT0405_CLI.exe --dump-packets 15
 
-# Run automated decoder unit tests
+# Run the automated regression suite
 .\build\bin\Release\CT0405_CLI.exe --test-decoder
 
 # Test Windows Ink synthetic pen pointer injection
 .\build\bin\Release\CT0405_CLI.exe --test-injection
+
+# Run the driver headless, without the control panel
+.\build\bin\Release\CT0405_CLI.exe --headless
 ```
+
+`--diagnose` prints the HID **usage page**, whether the device is supported, and a
+candidate score for every collection. A tablet publishes several collections under one
+VID/PID and only some of them carry pen reports, so the driver picks the digitizer
+collection by score rather than taking whichever one Windows enumerates first.
+
+### Report protocol
+
+The CT-0405-U sends 7-byte reports. The decoder implements exactly this layout and
+refuses anything that does not match, rather than guessing:
+
+| Byte | Meaning |
+| :--- | :--- |
+| `[0]` | Report id (`0x01` status, `0x02` motion) |
+| `[1..2]` | X position, little endian |
+| `[3..4]` | Y position, little endian |
+| `[5]` | Status: bit 7 in-range, bit 6 barrel, bit 5 eraser, bit 4 barrel 2 |
+| `[6]` | Pressure, signed, biased by +127 |
+
+A report that decodes to coordinates far outside the tablet's physical range is
+discarded as a misread rather than injected as pointer input.
 
 ---
 

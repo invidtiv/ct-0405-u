@@ -2,6 +2,8 @@
 
 #include "Common.h"
 #include <windows.h>
+#include <mutex>
+#include <cstdint>
 
 namespace ct0405 {
 
@@ -27,40 +29,61 @@ public:
     InputInjector();
     ~InputInjector();
 
+    InputInjector(const InputInjector&) = delete;
+    InputInjector& operator=(const InputInjector&) = delete;
+
+    // Returns true when the requested mode is ready to inject. Mouse-emulation
+    // mode needs no device, so it always succeeds.
     bool Initialize(bool use_windows_ink = true);
     void Shutdown();
 
-    void UpdateConfig(const DriverConfig& config);
+    // Inject state into Windows using the supplied configuration snapshot.
+    void Inject(const TabletProcessedState& state, const DriverConfig& config);
 
-    // Inject state into Windows
-    void Inject(const TabletProcessedState& state);
-
-    // Release all held buttons / contacts on proximity loss
+    // Release all held buttons / contacts on proximity loss or shutdown.
     void ReleaseAll();
 
-    bool IsWindowsInkSupported() const { return m_synthetic_device != nullptr; }
+    bool IsWindowsInkActive() const;
+    bool IsWindowsInkSupported() const { return m_pfnCreateDevice != nullptr; }
 
 private:
-    void InjectWindowsInk(const TabletProcessedState& state);
-    void InjectMouse(const TabletProcessedState& state);
-    void HandleButtonShortcuts(const TabletProcessedState& state);
+    // Which synthetic mouse buttons are currently held down by us.
+    enum HeldButton : uint32_t {
+        HB_NONE   = 0,
+        HB_LEFT   = 1u << 0,
+        HB_RIGHT  = 1u << 1,
+        HB_MIDDLE = 1u << 2
+    };
 
-    DriverConfig m_config;
+    void InjectWindowsInkLocked(const TabletProcessedState& state, const DriverConfig& config,
+                                bool pen_contact, bool barrel_flag, bool eraser_flag);
+    void InjectMouseLocked(const TabletProcessedState& state, bool left_contact);
+    void ReleaseAllLocked();
+
+    // Applies an edge-triggered button action. `pressed`/`prev_pressed` describe
+    // the physical button; returns the pen flags the action contributes.
+    void ApplyButtonAction(ButtonAction action, bool pressed, bool prev_pressed,
+                           bool& out_barrel_flag, bool& out_eraser_flag);
+
+    void SetHeldButton(uint32_t bit, bool down);
+    void SendKeyChord(WORD modifier, WORD key);
+
+    mutable std::mutex m_mutex;   // guards the synthetic device and all prev-state
+
     HSYNTHETICPOINTERDEVICE m_synthetic_device = nullptr;
-    bool m_ink_initialized = false;
     bool m_use_ink = true;
 
-    // Pointer API function pointers
+    // Pointer API function pointers (resolved once in the constructor, const thereafter)
     PFN_CreateSyntheticPointerDevice m_pfnCreateDevice = nullptr;
     PFN_InjectSyntheticPointerInput m_pfnInjectInput = nullptr;
     PFN_DestroySyntheticPointerDevice m_pfnDestroyDevice = nullptr;
 
     // Previous state tracking
     bool m_prev_in_proximity = false;
-    bool m_prev_in_contact = false;
+    bool m_prev_pen_contact = false;
     bool m_prev_barrel_1 = false;
     bool m_prev_barrel_2 = false;
-    bool m_prev_eraser = false;
+    uint32_t m_held_buttons = HB_NONE;
     int32_t m_last_x = 0;
     int32_t m_last_y = 0;
 };
