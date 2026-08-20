@@ -12,9 +12,10 @@ OneEuroFilter::OneEuroFilter(double min_cutoff, double beta, double d_cutoff)
 }
 
 void OneEuroFilter::SetParameters(double min_cutoff, double beta, double d_cutoff) {
-    m_min_cutoff = min_cutoff;
+    // Guard against a config that would divide by zero or invert the filter.
+    m_min_cutoff = (min_cutoff > 0.0001) ? min_cutoff : 0.0001;
     m_beta = beta;
-    m_d_cutoff = d_cutoff;
+    m_d_cutoff = (d_cutoff > 0.0001) ? d_cutoff : 0.0001;
 }
 
 double OneEuroFilter::ComputeAlpha(double cutoff, double dt) {
@@ -55,25 +56,15 @@ SignalProcessor::SignalProcessor() {
     Reset();
 }
 
-void SignalProcessor::UpdateConfig(const DriverConfig& config) {
-    m_config = config;
-    m_filter_x.SetParameters(config.filter_min_cutoff, config.filter_beta, config.filter_d_cutoff);
-    m_filter_y.SetParameters(config.filter_min_cutoff, config.filter_beta, config.filter_d_cutoff);
-    m_filter_pressure.SetParameters(2.0, 0.01, 1.0);
-}
-
-void SignalProcessor::SetTabletCapabilities(const TabletCapabilities& caps) {
-    m_caps = caps;
-}
-
 void SignalProcessor::Reset() {
     m_filter_x.Reset();
     m_filter_y.Reset();
-    m_filter_pressure.Reset();
     m_was_in_proximity = false;
 }
 
-TabletProcessedState SignalProcessor::Process(const TabletRawState& raw) {
+TabletProcessedState SignalProcessor::Process(const TabletRawState& raw,
+                                              const DriverConfig& config,
+                                              const TabletCapabilities& caps) {
     TabletProcessedState processed;
     processed.in_proximity = raw.in_proximity;
     processed.tool = raw.tool;
@@ -83,15 +74,15 @@ TabletProcessedState SignalProcessor::Process(const TabletRawState& raw) {
     processed.eraser_active = (raw.tool == ToolType::Eraser || raw.eraser_switch);
 
     if (!raw.in_proximity) {
-        m_was_in_proximity = false;
         processed.pressure = 0.0;
+        processed.raw_normalized_pressure = 0.0;
         processed.injection_pressure = 0;
         processed.is_contact = false;
         Reset();
         return processed;
     }
 
-    double timestamp_sec = static_cast<double>(raw.timestamp_us) / 1000000.0;
+    const double timestamp_sec = static_cast<double>(raw.timestamp_us) / 1000000.0;
 
     // Reset filters on fresh proximity entry to prevent dragging from old location
     if (!m_was_in_proximity) {
@@ -99,10 +90,14 @@ TabletProcessedState SignalProcessor::Process(const TabletRawState& raw) {
         m_was_in_proximity = true;
     }
 
-    // Normalize coordinates (0.0 to 1.0)
-    uint32_t max_x = m_config.tablet_max_x ? m_config.tablet_max_x : (m_caps.max_x ? m_caps.max_x : 5040);
-    uint32_t max_y = m_config.tablet_max_y ? m_config.tablet_max_y : (m_caps.max_y ? m_caps.max_y : 3780);
-    uint32_t max_p = m_config.tablet_max_pressure ? m_config.tablet_max_pressure : (m_caps.max_pressure ? m_caps.max_pressure : 255);
+    m_filter_x.SetParameters(config.filter_min_cutoff, config.filter_beta, config.filter_d_cutoff);
+    m_filter_y.SetParameters(config.filter_min_cutoff, config.filter_beta, config.filter_d_cutoff);
+
+    // Effective bounds are resolved by the driver (device detection, user
+    // override, or auto-expansion) and arrive here already decided.
+    const uint32_t max_x = caps.max_x ? caps.max_x : 5040;
+    const uint32_t max_y = caps.max_y ? caps.max_y : 3780;
+    const uint32_t max_p = caps.max_pressure ? caps.max_pressure : 255;
 
     double norm_x = static_cast<double>(raw.raw_x) / static_cast<double>(max_x);
     double norm_y = static_cast<double>(raw.raw_y) / static_cast<double>(max_y);
@@ -111,7 +106,7 @@ TabletProcessedState SignalProcessor::Process(const TabletRawState& raw) {
     norm_y = std::clamp(norm_y, 0.0, 1.0);
 
     // Apply smoothing filter if enabled
-    if (m_config.enable_smoothing) {
+    if (config.enable_smoothing) {
         norm_x = m_filter_x.Filter(norm_x, timestamp_sec);
         norm_y = m_filter_y.Filter(norm_y, timestamp_sec);
     }
@@ -122,33 +117,43 @@ TabletProcessedState SignalProcessor::Process(const TabletRawState& raw) {
     // Normalize raw pressure
     double raw_norm_pressure = static_cast<double>(raw.raw_pressure) / static_cast<double>(max_p);
     raw_norm_pressure = std::clamp(raw_norm_pressure, 0.0, 1.0);
+    processed.raw_normalized_pressure = raw_norm_pressure;
 
-    // Apply Deadzones
+    // Apply deadzone
+    const double min_threshold = std::clamp(config.pressure_min_threshold, 0.0, 1.0);
+    const double max_threshold = std::clamp(config.pressure_max_threshold, 0.0, 1.0);
+    const bool above_deadzone = (min_threshold <= 0.0) || (raw_norm_pressure > min_threshold);
+
     double final_pressure = 0.0;
-    if (raw_norm_pressure > m_config.pressure_min_threshold) {
-        double range = m_config.pressure_max_threshold - m_config.pressure_min_threshold;
+    if (above_deadzone) {
+        const double range = max_threshold - min_threshold;
         if (range > 0.01) {
-            double normalized_in_range = (raw_norm_pressure - m_config.pressure_min_threshold) / range;
+            const double normalized_in_range = (raw_norm_pressure - min_threshold) / range;
             final_pressure = std::clamp(normalized_in_range, 0.0, 1.0);
         } else {
             final_pressure = 1.0;
         }
 
-        // Apply Pressure Curve
-        final_pressure = ApplyPressureCurve(final_pressure);
+        final_pressure = ApplyPressureCurve(final_pressure, config);
     }
 
     processed.pressure = final_pressure;
     // Scale for Windows Ink injection (0..1024 standard resolution)
-    processed.injection_pressure = static_cast<uint32_t>(final_pressure * 1024.0);
-    processed.is_contact = (final_pressure > 0.001) || raw.tip_switch;
+    processed.injection_pressure = static_cast<uint32_t>(std::lround(final_pressure * 1024.0));
+
+    // The deadzone gates contact, not just the reported pressure value.
+    // Previously the hardware tip switch was OR'd in here, and for this family
+    // that switch trips at the lightest possible touch - so the deadzone slider
+    // attenuated the pressure curve but never suppressed the click, which is
+    // the thing users reach for that control to fix.
+    processed.is_contact = raw.tip_switch && above_deadzone;
 
     return processed;
 }
 
-double SignalProcessor::ApplyPressureCurve(double p) const {
+double SignalProcessor::ApplyPressureCurve(double p, const DriverConfig& config) {
     p = std::clamp(p, 0.0, 1.0);
-    switch (m_config.curve_type) {
+    switch (config.curve_type) {
         case PressureCurveType::Linear:
             return p;
         case PressureCurveType::Soft:
@@ -160,7 +165,7 @@ double SignalProcessor::ApplyPressureCurve(double p) const {
         case PressureCurveType::Hard:
             return std::pow(p, 2.2);
         case PressureCurveType::CustomBezier:
-            return EvaluateCubicBezier(p, m_config.custom_bezier_p1, m_config.custom_bezier_p2);
+            return EvaluateCubicBezier(p, config.custom_bezier_p1, config.custom_bezier_p2);
         default:
             return p;
     }

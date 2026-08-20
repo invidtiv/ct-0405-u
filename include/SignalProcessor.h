@@ -55,29 +55,29 @@ private:
     bool m_initialized;
 };
 
-// Master Signal Processor handling 2D smoothing, jitter suppression, and pressure mapping
+// Master Signal Processor handling 2D smoothing, jitter suppression, and pressure mapping.
+//
+// Holds no configuration of its own: every call is passed the immutable config
+// snapshot and the effective capabilities the driver resolved for this device.
+// That is what makes it safe to reconfigure the driver while the HID thread is
+// mid-packet, and it means the class can be unit tested without a setup call.
 class SignalProcessor {
 public:
     SignalProcessor();
 
-    void UpdateConfig(const DriverConfig& config);
-    void SetTabletCapabilities(const TabletCapabilities& caps);
-
-    // Process raw tablet state into smoothed, calibrated state
-    TabletProcessedState Process(const TabletRawState& raw);
+    // Process raw tablet state into smoothed, calibrated state.
+    TabletProcessedState Process(const TabletRawState& raw,
+                                 const DriverConfig& config,
+                                 const TabletCapabilities& caps);
 
     void Reset();
 
-private:
-    double ApplyPressureCurve(double normalized_pressure) const;
+    static double ApplyPressureCurve(double normalized_pressure, const DriverConfig& config);
     static double EvaluateCubicBezier(double t, double p1, double p2);
 
-    DriverConfig m_config;
-    TabletCapabilities m_caps;
-
+private:
     OneEuroFilter m_filter_x;
     OneEuroFilter m_filter_y;
-    OneEuroFilter m_filter_pressure;
 
     bool m_was_in_proximity = false;
 };
