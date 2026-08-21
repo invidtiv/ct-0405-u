@@ -656,7 +656,7 @@ void MainWindow::CreateControls() {
     m_hEditMaxY = make(L"EDIT", L"3780", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, ID_EDIT_MAX_Y, WS_EX_CLIENTEDGE);
     m_hBtnResetArea = make(L"BUTTON", L"Reset Bounds", BS_PUSHBUTTON | WS_TABSTOP, ID_BTN_RESET_AREA);
     m_hCheckAutoDetect = make(L"BUTTON", L"Auto-Expand Bounds", BS_AUTOCHECKBOX | WS_TABSTOP, ID_CHECK_AUTODETECT);
-    m_hBtnCalibrate = make(L"BUTTON", L"Calibrate Corners", BS_PUSHBUTTON | WS_TABSTOP, ID_BTN_CALIBRATE);
+    m_hBtnCalibrate = make(L"BUTTON", L"Calibrate Area", BS_PUSHBUTTON | WS_TABSTOP, ID_BTN_CALIBRATE);
 
     m_hComboMapping = make(L"COMBOBOX", nullptr, comboStyle, ID_COMBO_MAPPING);
     SendMessageW(m_hComboMapping, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Virtual Desktop"));
@@ -948,21 +948,18 @@ void MainWindow::PersistConfigNow() {
 // --- Driver callbacks (NOT on the UI thread) --------------------------------
 
 void MainWindow::OnStateUpdate(const TabletRawState& raw, const TabletProcessedState& processed) {
-    bool calibration_sample = false;
-    {
-        std::lock_guard<std::mutex> lock(m_ui_mutex);
-        m_live_raw = raw;
-        m_live_processed = processed;
-        calibration_sample = (m_calibration_step == CalibrationStep::WaitingForTopLeft ||
-                              m_calibration_step == CalibrationStep::WaitingForBottomRight) &&
-                             (processed.is_contact || raw.tip_switch);
-    }
+    std::lock_guard<std::mutex> lock(m_ui_mutex);
+    m_live_raw = raw;
+    m_live_processed = processed;
 
-    // Post, never send. This handler runs on the HID reader thread; a blocking
-    // cross-thread SendMessage from here - while holding m_ui_mutex, which the
-    // paint path also takes - deadlocked both threads.
-    if (calibration_sample && m_hWnd) {
-        PostMessageW(m_hWnd, WM_APP_TABLET_STATE, 0, 0);
+    // Recording the sweep is pure arithmetic, so it can safely happen right
+    // here on the HID thread. Nothing touches a window and nothing blocks.
+    if (m_calibration_step == CalibrationStep::Sweeping && raw.in_proximity) {
+        m_calib_min_x = std::min(m_calib_min_x, raw.raw_x);
+        m_calib_min_y = std::min(m_calib_min_y, raw.raw_y);
+        m_calib_max_x = std::max(m_calib_max_x, raw.raw_x);
+        m_calib_max_y = std::max(m_calib_max_y, raw.raw_y);
+        ++m_calib_samples;
     }
 }
 
@@ -1001,62 +998,98 @@ void MainWindow::HandleConnectionChangeOnUiThread() {
 }
 
 void MainWindow::HandleTabletStateOnUiThread() {
-    TabletRawState raw;
+    // Retained for future driver-initiated UI updates; the sweep records itself.
+}
+
+std::wstring MainWindow::CalibrationHintText() const {
+    uint32_t lo_x, hi_x, lo_y, hi_y, samples;
     {
         std::lock_guard<std::mutex> lock(m_ui_mutex);
-        raw = m_live_raw;
+        lo_x = m_calib_min_x; hi_x = m_calib_max_x;
+        lo_y = m_calib_min_y; hi_y = m_calib_max_y;
+        samples = m_calib_samples;
     }
+    if (samples == 0) return L"Sweep the pen around the edge of the tablet...";
 
-    switch (m_calibration_step) {
-        case CalibrationStep::WaitingForTopLeft:
-            m_calib_min_x = raw.raw_x;
-            m_calib_min_y = raw.raw_y;
-            m_calibration_step = CalibrationStep::WaitingForBottomRight;
-            SetWindowTextW(m_hBtnCalibrate, L"Touch Bottom-Right...");
-            break;
-
-        case CalibrationStep::WaitingForBottomRight:
-            if (raw.raw_x > m_calib_min_x + 300 && raw.raw_y > m_calib_min_y + 300) {
-                m_calib_max_x = raw.raw_x;
-                m_calib_max_y = raw.raw_y;
-                m_calibration_step = CalibrationStep::Completed;
-                SetWindowTextW(m_hBtnCalibrate, L"Calibrate Corners");
-
-                m_suppress_ui_events = true;
-                SetWindowTextW(m_hEditMaxX, std::to_wstring(m_calib_max_x).c_str());
-                SetWindowTextW(m_hEditMaxY, std::to_wstring(m_calib_max_y).c_str());
-                m_suppress_ui_events = false;
-
-                ApplyConfigFromUI(true);
-                m_trayIcon.ShowBalloon(L"Wacom CT-0405-U Driver",
-                                       L"Calibration complete. Tablet bounds updated.");
-            }
-            break;
-
-        default:
-            break;
-    }
+    std::wostringstream ss;
+    ss << L"X " << lo_x << L".." << hi_x << L"   Y " << lo_y << L".." << hi_y
+       << L"   (" << samples << L" samples)";
+    return ss.str();
 }
 
 // --- Actions ---------------------------------------------------------------
 
 void MainWindow::StartCalibration() {
-    if (m_calibration_step == CalibrationStep::WaitingForTopLeft ||
-        m_calibration_step == CalibrationStep::WaitingForBottomRight) {
-        CancelCalibration();
+    {
+        std::lock_guard<std::mutex> lock(m_ui_mutex);
+        if (m_calibration_step == CalibrationStep::Sweeping) {
+            return;   // handled by FinishCalibration
+        }
+        m_calib_min_x = 0xFFFFFFFFu;
+        m_calib_min_y = 0xFFFFFFFFu;
+        m_calib_max_x = 0;
+        m_calib_max_y = 0;
+        m_calib_samples = 0;
+        m_calibration_step = CalibrationStep::Sweeping;
+    }
+    SetWindowTextW(m_hBtnCalibrate, L"Finish Calibration");
+    m_trayIcon.ShowBalloon(L"Wacom CT-0405-U Driver",
+                           L"Sweep the pen right around the edge of the drawing area, "
+                           L"into all four corners, then click Finish Calibration.");
+}
+
+void MainWindow::FinishCalibration() {
+    uint32_t lo_x, hi_x, lo_y, hi_y, samples;
+    {
+        std::lock_guard<std::mutex> lock(m_ui_mutex);
+        m_calibration_step = CalibrationStep::None;
+        lo_x = m_calib_min_x; hi_x = m_calib_max_x;
+        lo_y = m_calib_min_y; hi_y = m_calib_max_y;
+        samples = m_calib_samples;
+    }
+    SetWindowTextW(m_hBtnCalibrate, L"Calibrate Area");
+
+    // Refuse a sweep that plainly did not cover the surface, rather than
+    // writing bounds that would cramp the mapping.
+    const bool usable = samples >= 20 && hi_x > lo_x && hi_y > lo_y &&
+                        (hi_x - lo_x) >= MIN_SANE_TABLET_BOUND &&
+                        (hi_y - lo_y) >= MIN_SANE_TABLET_BOUND;
+    if (!usable) {
+        m_trayIcon.ShowBalloon(L"Wacom CT-0405-U Driver",
+                               L"Not enough of the surface was covered. Nothing was changed - "
+                               L"try again and sweep right into all four corners.",
+                               NIIF_WARNING);
+        InvalidateRect(m_hWnd, nullptr, FALSE);
         return;
     }
-    m_calibration_step = CalibrationStep::WaitingForTopLeft;
-    SetWindowTextW(m_hBtnCalibrate, L"Touch Top-Left... (click to cancel)");
+
+    DriverConfig c = m_driver.GetConfig();
+    c.tablet_min_x = lo_x;
+    c.tablet_min_y = lo_y;
+    c.tablet_max_x = hi_x;
+    c.tablet_max_y = hi_y;
+    c.bounds_source = BoundsSource::UserSet;
+    m_driver.SetConfig(c, true);
+    LoadConfigToUI();
+
+    std::wostringstream msg;
+    msg << L"Calibrated from " << samples << L" samples: X " << lo_x << L".." << hi_x
+        << L", Y " << lo_y << L".." << hi_y;
+    m_trayIcon.ShowBalloon(L"Wacom CT-0405-U Driver", msg.str());
 }
 
 void MainWindow::CancelCalibration() {
-    m_calibration_step = CalibrationStep::None;
-    SetWindowTextW(m_hBtnCalibrate, L"Calibrate Corners");
+    {
+        std::lock_guard<std::mutex> lock(m_ui_mutex);
+        m_calibration_step = CalibrationStep::None;
+    }
+    SetWindowTextW(m_hBtnCalibrate, L"Calibrate Area");
 }
 
 void MainWindow::ResetActiveArea() {
     DriverConfig c = m_driver.GetConfig();
+    c.tablet_min_x = 0;
+    c.tablet_min_y = 0;
     c.tablet_max_x = CT0405U_MAX_X;
     c.tablet_max_y = CT0405U_MAX_Y;
     c.tablet_area_left = 0.0;
@@ -1180,7 +1213,15 @@ LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 ApplyConfigFromUI(false);
             } else if (code == BN_CLICKED) {
                 switch (wmId) {
-                    case ID_BTN_CALIBRATE:       StartCalibration(); break;
+                    case ID_BTN_CALIBRATE: {
+                        bool sweeping;
+                        {
+                            std::lock_guard<std::mutex> lock(m_ui_mutex);
+                            sweeping = (m_calibration_step == CalibrationStep::Sweeping);
+                        }
+                        if (sweeping) FinishCalibration(); else StartCalibration();
+                        break;
+                    }
                     case ID_BTN_RESET_AREA:      ResetActiveArea(); break;
                     case ID_BTN_SET_SCREEN_AREA: OpenScreenAreaOverlay(); break;
                     case ID_BTN_APPLY:
@@ -1448,7 +1489,11 @@ void MainWindow::RenderCards(Gdiplus::Graphics& g, int /*width*/, int /*height*/
     text_at(deviceText.c_str(), valueFont, cardX + 68.0f, 88.0f, connected ? greenBrush : redBrush);
 
     text_at(L"Bounds:", labelFont, cardX + 235.0f, 88.0f, labelBrush);
-    const std::wstring bStr = std::to_wstring(caps.max_x) + L" x " + std::to_wstring(caps.max_y);
+    const std::wstring bStr =
+        (caps.min_x || caps.min_y)
+            ? (std::to_wstring(caps.min_x) + L"-" + std::to_wstring(caps.max_x) + L" x " +
+               std::to_wstring(caps.min_y) + L"-" + std::to_wstring(caps.max_y))
+            : (std::to_wstring(caps.max_x) + L" x " + std::to_wstring(caps.max_y));
     text_at(bStr.c_str(), valueFont, cardX + 295.0f, 88.0f, whiteBrush);
 
     text_at(L"Pointer:", labelFont, cardX + 14.0f, 110.0f, labelBrush);
@@ -1470,6 +1515,15 @@ void MainWindow::RenderCards(Gdiplus::Graphics& g, int /*width*/, int /*height*/
     text_at(L"TABLET SPACE & CALIBRATION", cardHeaderFont, cardX + 14.0f, 154.0f, headerBrush);
     text_at(L"Max X:", labelFont, cardX + 14.0f, 208.0f, labelBrush);
     text_at(L"Max Y:", labelFont, cardX + 162.0f, 208.0f, labelBrush);
+
+    bool sweeping;
+    {
+        std::lock_guard<std::mutex> lock(m_ui_mutex);
+        sweeping = (m_calibration_step == CalibrationStep::Sweeping);
+    }
+    if (sweeping) {
+        text_at(CalibrationHintText().c_str(), labelFont, cardX + 14.0f, 246.0f, cyanBrush);
+    }
 
     // --- CARD 3: SCREEN MAPPING & WINDOWS INK ---
     draw_card(cardX, 276.0f, cardW, 102.0f);

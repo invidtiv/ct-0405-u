@@ -55,15 +55,18 @@ bytes you would need.
 - **Target Any App Window:** Drag and resize the rectangle over any specific monitor, canvas, or application window (Photoshop, Krita, OneNote, etc.).
 - **Quick Controls:** Press `Enter` or double-click to apply, `Esc` to cancel, or use arrow keys to nudge.
 
-### 3. 2-Point Physical Corner Calibration
-- Click **"Calibrate Corners"** to lock the hardware boundaries of your physical tablet surface.
-- Touch the top-left corner, then the bottom-right corner of the tablet surface with the pen tip.
-- The driver captures the exact hardware minimum and maximum coordinates.
+### 3. Sweep Calibration
+- Click **"Calibrate Area"**, sweep the pen right around the edge of the drawing surface and into all four corners, then click **"Finish Calibration"**.
+- The driver records the smallest and largest coordinate seen across the whole sweep. The live range and sample count are shown on the status card while you sweep.
+- A sweep that did not cover enough of the surface is rejected rather than written, so a half-finished calibration cannot cramp your mapping.
+
+> **Why sweeping rather than tapping corners.** A tap registers wherever the pen actually lands, which is always slightly *inside* the true range. Two-point corner calibration therefore under-measures the surface every time, and the pen then reaches the edge of the mapped screen area before it reaches the physical edge of the tablet. Sliding into the corners finds the real extremes. On a CT-0405-U a good sweep should report very close to `X 0..5040, Y 0..3780`.
 
 ### 4. Automatic & User-Definable Tablet Space
 - **Automatic detection:** the tablet's coordinate bounds are adopted on connect, so mapping is correct with no manual setup.
-- Use the stock CT-0405-U bounds (5040 x 3780), or enter your own `Max X` and `Max Y`. Typing bounds or running the corner calibration marks them as user-set, so automatic detection will not overwrite them. **Reset Bounds** hands control back to detection.
-- **Auto-Expand Bounds:** raises the active bounds when the hardware reports coordinates beyond the current ceiling.
+- Use the stock CT-0405-U bounds (5040 x 3780), or enter your own `Max X` and `Max Y`. Typing bounds or running a calibration marks them as user-set, so automatic detection will not overwrite them. **Reset Bounds** hands control back to detection.
+- Both a **minimum and a maximum** are stored per axis. Coordinates are normalized across the measured span rather than from an assumed zero origin, so a tablet whose usable area does not start at `0,0` still maps correctly.
+- **Auto-Expand Bounds:** raises the ceiling when the hardware reports past it. It never overrides an explicit calibration - if you measured your own surface, that measurement stands until you change it.
 
 ### 5. Native Windows Ink (Synthetic Pen Pointer Injection)
 - Uses Windows `CreateSyntheticPointerDevice` and `InjectSyntheticPointerInput` API (`POINTER_TYPE_PEN`) for native pressure sensitivity and eraser tool switching in all modern Windows applications.
@@ -88,7 +91,8 @@ bytes you would need.
 
 ### 9. Automatic Settings Persistence
 - All settings, custom resolutions, overlay rectangles, and calibration bounds are saved to `%APPDATA%\CT0405_Driver\config.json`.
-- **Portable mode:** place a `config.json` next to the executable and that file is used instead. The location is resolved from the executable's own directory, so it does not change when the app is started by Windows autostart.
+- **Portable mode:** create an empty `portable.txt` next to the executable, and settings are kept beside the program instead. Both paths are resolved from the executable's own directory, never the working directory, so they do not change when Windows starts the app automatically.
+- Upgrading from v1.1.0 or earlier: those releases also wrote a `config.json` next to the executable as a side effect of every save. That file is migrated into `%APPDATA%` on first run and renamed `config.json.migrated`, so a stale copy cannot silently override your real settings.
 - Settings are applied to the running driver immediately and written to disk shortly after you stop adjusting them, so dragging a slider does not thrash the file.
 - Writes are atomic (write-then-rename); a failed save is reported rather than silently discarded.
 
@@ -186,6 +190,34 @@ candidate score for every collection. A tablet publishes several collections und
 VID/PID and only some of them carry pen reports, so the driver picks the digitizer
 collection by score rather than taking whichever one Windows enumerates first.
 
+### Diagnosing a mapping problem
+
+Two read-only commands. Neither injects input, so your cursor stays put and taps
+do not click anything:
+
+```cmd
+:: Show the full raw -> normalized -> screen chain for every packet
+.\build\bin\Release\CT0405_CLI.exe --trace 30
+
+:: Narrate the low-level HID read path when no data is arriving at all
+.\build\bin\Release\CT0405_CLI.exe --probe 20
+```
+
+`--trace` prints the configuration actually in effect (including which config
+file was loaded and the bounds after detection and auto-expand), then a line per
+sample showing raw coordinates, normalized position and the screen pixel they
+map to. It finishes with the observed range and how much of the configured
+bounds the pen actually reached. **Sweep the pen around the rim** while it runs -
+sliding finds the true extremes, tapping does not.
+
+`--probe` bypasses the driver entirely and talks to Win32 directly, reporting the
+result of every `ReadFile` with a heartbeat each second. Use it to tell "the pen
+sent nothing" apart from "the read path is broken": a healthy idle device shows
+the read staying `pending`, whereas a real fault prints an error code.
+
+Note that the CT-0405-U is an EMR digitizer with **no touch sensing** - it
+responds only to the stylus, so a finger produces no packets at all.
+
 ### Report protocol
 
 The CT-0405-U sends 7-byte reports. The decoder implements exactly this layout and
@@ -206,7 +238,13 @@ discarded as a misread rather than injected as pointer input.
 
 ## Credits & Attribution
 
-This driver software and control panel application was designed, architected, and developed by **Antigravity** using **Gemini 3.7 Flash** (Google DeepMind).
+The original driver, control panel and packet decoder were designed, architected
+and developed by **Antigravity** using **Gemini 3.7 Flash** (Google DeepMind).
+
+The v1.1.x work - a full code review and the thread-safety, device-lifetime,
+configuration and calibration fixes that came out of it - was carried out by
+**Claude Opus 5** via [Claude Code](https://claude.com/claude-code) (Anthropic),
+working against real CT-0405-U hardware.
 
 ---
 

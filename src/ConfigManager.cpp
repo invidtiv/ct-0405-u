@@ -28,6 +28,14 @@ bool FileExists(const std::wstring& path) {
     return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// True when `a` was written more recently than `b`.
+bool FileIsNewer(const std::wstring& a, const std::wstring& b) {
+    WIN32_FILE_ATTRIBUTE_DATA fa{}, fb{};
+    if (!GetFileAttributesExW(a.c_str(), GetFileExInfoStandard, &fa)) return false;
+    if (!GetFileAttributesExW(b.c_str(), GetFileExInfoStandard, &fb)) return true;
+    return CompareFileTime(&fa.ftLastWriteTime, &fb.ftLastWriteTime) > 0;
+}
+
 // Finds "key" as a top-level field and returns the offset of its value.
 size_t FindValueStart(const std::string& json, const std::string& key) {
     const std::string needle = "\"" + key + "\"";
@@ -98,13 +106,29 @@ std::wstring ConfigManager::GetAppDataConfigPath() {
     return L"config.json";
 }
 
-std::wstring ConfigManager::GetConfigPath() {
+std::wstring ConfigManager::GetPortableMarkerPath() {
     const std::wstring exeDir = GetExecutableDirectory();
-    if (!exeDir.empty()) {
-        const std::wstring portable = exeDir + L"\\config.json";
-        if (FileExists(portable)) {
-            return portable;
-        }
+    if (exeDir.empty()) return L"";
+    return exeDir + L"\\portable.txt";
+}
+
+bool ConfigManager::IsPortableMode() {
+    const std::wstring marker = GetPortableMarkerPath();
+    return !marker.empty() && FileExists(marker);
+}
+
+std::wstring ConfigManager::FindLegacyStrayConfig() {
+    if (IsPortableMode()) return L"";
+    const std::wstring exeDir = GetExecutableDirectory();
+    if (exeDir.empty()) return L"";
+    const std::wstring stray = exeDir + L"\\config.json";
+    return FileExists(stray) ? stray : L"";
+}
+
+std::wstring ConfigManager::GetConfigPath() {
+    if (IsPortableMode()) {
+        const std::wstring exeDir = GetExecutableDirectory();
+        if (!exeDir.empty()) return exeDir + L"\\config.json";
     }
     return GetAppDataConfigPath();
 }
@@ -156,6 +180,8 @@ std::string ConfigManager::SerializeToJson(const DriverConfig& c) {
     // Enough significant digits that every double round-trips unchanged.
     ss << std::setprecision(12);
     ss << "{\n";
+    ss << "  \"tablet_min_x\": " << c.tablet_min_x << ",\n";
+    ss << "  \"tablet_min_y\": " << c.tablet_min_y << ",\n";
     ss << "  \"tablet_max_x\": " << c.tablet_max_x << ",\n";
     ss << "  \"tablet_max_y\": " << c.tablet_max_y << ",\n";
     ss << "  \"tablet_max_pressure\": " << c.tablet_max_pressure << ",\n";
@@ -200,6 +226,12 @@ DriverConfig ConfigManager::DeserializeFromJson(const std::string& json) {
 
     const int pressure = ExtractFieldInt(json, "tablet_max_pressure", static_cast<int>(c.tablet_max_pressure));
     c.tablet_max_pressure = (pressure > 0 && pressure <= 8192) ? static_cast<uint32_t>(pressure) : c.tablet_max_pressure;
+
+    // Minimums are only meaningful below the corresponding maximum.
+    const int min_x = ExtractFieldInt(json, "tablet_min_x", static_cast<int>(c.tablet_min_x));
+    const int min_y = ExtractFieldInt(json, "tablet_min_y", static_cast<int>(c.tablet_min_y));
+    c.tablet_min_x = (min_x >= 0 && static_cast<uint32_t>(min_x) < c.tablet_max_x) ? static_cast<uint32_t>(min_x) : 0;
+    c.tablet_min_y = (min_y >= 0 && static_cast<uint32_t>(min_y) < c.tablet_max_y) ? static_cast<uint32_t>(min_y) : 0;
 
     c.auto_detect_bounds = ExtractFieldBool(json, "auto_detect_bounds", c.auto_detect_bounds);
 
@@ -274,6 +306,25 @@ DriverConfig ConfigManager::LoadConfigFrom(const std::wstring& file_path) {
 
 DriverConfig ConfigManager::LoadConfig() {
     const std::wstring path = GetConfigPath();
+
+    // One-time migration. Releases before v1.1.1 wrote config.json next to the
+    // executable as well as to AppData. Rather than ignore that file - which
+    // may hold the newest settings - adopt it when it is newer, then move it
+    // aside so it cannot shadow anything again.
+    const std::wstring stray = FindLegacyStrayConfig();
+    if (!stray.empty()) {
+        const bool stray_is_newer = !FileExists(path) || FileIsNewer(stray, path);
+        DriverConfig migrated = LoadConfigFrom(stray);
+        if (stray_is_newer) {
+            SaveConfigTo(migrated, path);
+        }
+        const std::wstring retired = stray + L".migrated";
+        DeleteFileW(retired.c_str());
+        MoveFileExW(stray.c_str(), retired.c_str(), MOVEFILE_REPLACE_EXISTING);
+        if (stray_is_newer) {
+            return migrated;
+        }
+    }
 
     if (FileExists(path)) {
         return LoadConfigFrom(path);

@@ -61,6 +61,11 @@ enum class ToolType {
 };
 
 struct TabletCapabilities {
+    // Lower edge of the usable coordinate range. The sensor origin is not at
+    // zero: a CT-0405-U typically starts reporting around 100,90 at the
+    // physical corner, so normalizing as raw/max shifts the whole mapping.
+    uint32_t min_x = 0;
+    uint32_t min_y = 0;
     uint32_t max_x = CT0405U_MAX_X;
     uint32_t max_y = CT0405U_MAX_Y;
     uint32_t max_pressure = CT0405U_MAX_PRESSURE;
@@ -170,7 +175,10 @@ enum class BoundsSource {
 constexpr uint32_t MIN_SANE_TABLET_BOUND = 500;
 
 struct DriverConfig {
-    // Custom Tablet Space Bounds
+    // Custom Tablet Space Bounds. min defaults to zero and is filled in by
+    // corner calibration, which measures where the surface actually starts.
+    uint32_t tablet_min_x = 0;
+    uint32_t tablet_min_y = 0;
     uint32_t tablet_max_x = CT0405U_MAX_X;
     uint32_t tablet_max_y = CT0405U_MAX_Y;
     uint32_t tablet_max_pressure = CT0405U_MAX_PRESSURE;

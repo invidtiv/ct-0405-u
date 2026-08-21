@@ -95,12 +95,18 @@ TabletProcessedState SignalProcessor::Process(const TabletRawState& raw,
 
     // Effective bounds are resolved by the driver (device detection, user
     // override, or auto-expansion) and arrive here already decided.
-    const uint32_t max_x = caps.max_x ? caps.max_x : 5040;
-    const uint32_t max_y = caps.max_y ? caps.max_y : 3780;
-    const uint32_t max_p = caps.max_pressure ? caps.max_pressure : 255;
+    const uint32_t max_x = caps.max_x ? caps.max_x : CT0405U_MAX_X;
+    const uint32_t max_y = caps.max_y ? caps.max_y : CT0405U_MAX_Y;
+    const uint32_t max_p = caps.max_pressure ? caps.max_pressure : CT0405U_MAX_PRESSURE;
 
-    double norm_x = static_cast<double>(raw.raw_x) / static_cast<double>(max_x);
-    double norm_y = static_cast<double>(raw.raw_y) / static_cast<double>(max_y);
+    // Normalize across the measured span, not from an assumed zero origin.
+    const uint32_t min_x = (caps.min_x < max_x) ? caps.min_x : 0;
+    const uint32_t min_y = (caps.min_y < max_y) ? caps.min_y : 0;
+    const double span_x = static_cast<double>(max_x - min_x);
+    const double span_y = static_cast<double>(max_y - min_y);
+
+    double norm_x = (static_cast<double>(raw.raw_x) - static_cast<double>(min_x)) / span_x;
+    double norm_y = (static_cast<double>(raw.raw_y) - static_cast<double>(min_y)) / span_y;
 
     norm_x = std::clamp(norm_x, 0.0, 1.0);
     norm_y = std::clamp(norm_y, 0.0, 1.0);

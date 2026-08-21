@@ -18,12 +18,22 @@ public:
     static bool SaveConfig(const DriverConfig& config);
     static bool SaveConfigTo(const DriverConfig& config, const std::wstring& file_path);
 
-    // The one file the driver reads and writes. A config.json sitting beside
-    // the executable wins (portable install); otherwise %APPDATA%. Resolved
-    // from the executable's own directory, never the working directory, which
-    // differs between a normal launch and an autostart launch.
+    // The one file the driver reads and writes.
+    //
+    // Portable mode requires an explicit marker file (portable.txt) beside the
+    // executable - NOT merely a config.json, because releases before v1.1.1
+    // wrote one there as a side effect of every save. Keying off its presence
+    // silently promoted that leftover above the user's real settings.
+    // Otherwise: %APPDATA%, resolved from the executable's own directory rather
+    // than the working directory, which differs on an autostart launch.
     static std::wstring GetConfigPath();
     static std::wstring GetAppDataConfigPath();
+    static std::wstring GetPortableMarkerPath();
+    static bool IsPortableMode();
+
+    // Path of a stray config.json left beside the executable by an older
+    // release, if one is present and portable mode is not enabled.
+    static std::wstring FindLegacyStrayConfig();
 
     // Registry autostart. Deliberately separate from SaveConfig: persisting
     // preferences should not have the side effect of rewriting a Run key.

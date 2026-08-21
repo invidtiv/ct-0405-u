@@ -96,17 +96,20 @@ TabletCapabilities TabletDriver::ResolveEffectiveCaps(const DriverConfig& config
         if (config.tablet_max_x >= MIN_SANE_TABLET_BOUND) caps.max_x = config.tablet_max_x;
         if (config.tablet_max_y >= MIN_SANE_TABLET_BOUND) caps.max_y = config.tablet_max_y;
         if (config.tablet_max_pressure > 0)               caps.max_pressure = config.tablet_max_pressure;
+        if (config.tablet_min_x < caps.max_x)             caps.min_x = config.tablet_min_x;
+        if (config.tablet_min_y < caps.max_y)             caps.min_y = config.tablet_min_y;
     }
 
-    // "Auto-expand bounds" now actually does something: the widest coordinate
-    // the hardware has produced raises the ceiling used for normalization.
-    if (config.auto_detect_bounds) {
-        caps.max_x = std::max(caps.max_x, m_decoder.GetObservedMaxX());
-        caps.max_y = std::max(caps.max_y, m_decoder.GetObservedMaxY());
-        const int32_t observed_p = m_decoder.GetObservedMaxPressure();
-        if (observed_p > 0) {
-            caps.max_pressure = std::max(caps.max_pressure, static_cast<uint32_t>(observed_p));
-        }
+    // "Auto-expand bounds" widens the ceiling when the hardware genuinely
+    // reports past it. It must never fight an explicit calibration: if the user
+    // measured their own corners, that number stands until they change it.
+    if (config.auto_detect_bounds && config.bounds_source != BoundsSource::UserSet) {
+        const uint32_t seen_x = m_decoder.GetObservedMaxX();
+        const uint32_t seen_y = m_decoder.GetObservedMaxY();
+        if (seen_x > 0) caps.max_x = std::max(caps.max_x, seen_x);
+        if (seen_y > 0) caps.max_y = std::max(caps.max_y, seen_y);
+        const int32_t seen_p = m_decoder.GetObservedMaxPressure();
+        if (seen_p > 0) caps.max_pressure = std::max(caps.max_pressure, static_cast<uint32_t>(seen_p));
     }
 
     return caps;

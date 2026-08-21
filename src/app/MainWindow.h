@@ -14,11 +14,13 @@
 
 namespace ct0405 {
 
+// Calibration measures the surface by sweeping, not by tapping two corners.
+// A tap always lands somewhere INSIDE the true range, so two-point calibration
+// systematically under-measures and the pen then reaches the screen edge before
+// the physical edge. Sweeping the rim records the actual extremes.
 enum class CalibrationStep {
     None,
-    WaitingForTopLeft,
-    WaitingForBottomRight,
-    Completed
+    Sweeping
 };
 
 class MainWindow {
@@ -83,7 +85,9 @@ private:
     void UpdateMappingModeControls();
 
     void StartCalibration();
+    void FinishCalibration();
     void CancelCalibration();
+    std::wstring CalibrationHintText() const;
     void ResetActiveArea();
     void OpenScreenAreaOverlay();
     bool ShouldExitOnClose() const { return !m_minimize_to_tray; }
@@ -144,12 +148,14 @@ private:
     bool m_pending_connection_state = false;
     std::wstring m_pending_connection_name;
 
-    // Calibration state (UI thread only, except the sample handoff)
+    // Calibration accumulators. Written by the HID thread and read by the UI
+    // thread, both under m_ui_mutex - integer min/max only, no window calls.
     CalibrationStep m_calibration_step = CalibrationStep::None;
-    uint32_t m_calib_min_x = 0;
-    uint32_t m_calib_min_y = 0;
-    uint32_t m_calib_max_x = 5040;
-    uint32_t m_calib_max_y = 3780;
+    uint32_t m_calib_min_x = 0xFFFFFFFFu;
+    uint32_t m_calib_min_y = 0xFFFFFFFFu;
+    uint32_t m_calib_max_x = 0;
+    uint32_t m_calib_max_y = 0;
+    uint32_t m_calib_samples = 0;
 
     bool m_minimize_to_tray = true;
     bool m_last_autostart_applied = false;
