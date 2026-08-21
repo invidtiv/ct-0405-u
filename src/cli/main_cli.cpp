@@ -7,6 +7,8 @@
 #include "InputInjector.h"
 
 #include <windows.h>
+#include <hidsdi.h>
+#include <hidpi.h>
 #include <iostream>
 #include <iomanip>
 #include <sstream>     // std::wostringstream - previously relied on transitive includes
@@ -62,6 +64,8 @@ void PrintUsage() {
     out << L"  --dump-packets, -p [s] Sniff raw HID packets (default 10 seconds)\n";
     out << L"  --test-injection, -t  Test Windows Ink Synthetic Pointer injection\n";
     out << L"  --test-decoder, -u    Run the automated regression suite\n";
+    out << L"  --trace, -r [s]       Show raw -> normalized -> screen mapping (no injection)\n";
+    out << L"  --probe, -b [s]       Narrate the low-level HID read path (diagnostic)\n";
     out << L"  --headless, -s        Run driver in headless background console mode\n";
     out << L"  --help, -h            Show this help message\n";
     out << L"========================================================\n";
@@ -387,6 +391,36 @@ bool RunDecoderUnitTests() {
         t.check(!decoder.DecodePacket(nullptr, 8, s3), L"Null buffer rejected");
     }
 
+    t.section(L"Observed extents (auto-expand)");
+    {
+        PacketDecoder decoder;
+
+        // Zero means "nothing seen yet". Seeding these with the nominal
+        // capabilities made auto-expand a floor, so calibrating to a SMALLER
+        // area could never take effect.
+        t.check(decoder.GetObservedMaxX() == 0, L"Fresh decoder has observed X of zero");
+        t.check(decoder.GetObservedMaxY() == 0, L"Fresh decoder has observed Y of zero");
+        t.check(decoder.GetObservedMaxPressure() == 0, L"Fresh decoder has observed pressure of zero");
+
+        uint8_t packet[] = { 0x01, 0xC4, 0x09, 0x08, 0x07, 0x80,
+                             static_cast<uint8_t>(100 - 127), 0x00 };
+        TabletRawState st;
+        decoder.DecodePacket(packet, sizeof(packet), st);
+        t.check(decoder.GetObservedMaxX() == 2500, L"Observed X records what was decoded");
+        t.check(decoder.GetObservedMaxY() == 1800, L"Observed Y records what was decoded");
+        t.check(decoder.GetObservedMaxPressure() == 100, L"Observed pressure records what was decoded");
+
+        // Declaring capabilities must not pretend the hardware reported them.
+        TabletCapabilities big;
+        big.max_x = 30000;
+        big.max_y = 30000;
+        decoder.SetCapabilities(big);
+        t.check(decoder.GetObservedMaxX() == 2500, L"SetCapabilities does not inflate observed extents");
+
+        decoder.Reset();
+        t.check(decoder.GetObservedMaxX() == 0, L"Reset forgets observed extents");
+    }
+
     t.section(L"Device identification");
     {
         t.check(DeviceEnumerator::IdentifyModel(WACOM_VENDOR_ID, PID_PENPARTNER_CT0405U)
@@ -444,6 +478,54 @@ bool RunDecoderUnitTests() {
         t.check(firm.is_contact, L"Firm touch above deadzone registers contact");
         t.check(firm.pressure > 0.0, L"Firm touch reports non-zero pressure");
         t.check(firm.raw_normalized_pressure > 0.8, L"Pre-curve pressure exposed for the UI");
+    }
+
+    t.section(L"Non-zero tablet origin");
+    {
+        SignalProcessor proc;
+        DriverConfig cfg;
+        cfg.enable_smoothing = false;
+        cfg.pressure_min_threshold = 0.0;
+
+        // Measured from a real CT-0405-U: the surface starts around 108,91 and
+        // runs to about 5001,3780. Treating the origin as 0,0 shifted every
+        // coordinate by the inset.
+        TabletCapabilities caps;
+        caps.min_x = 108;  caps.max_x = 5001;
+        caps.min_y = 91;   caps.max_y = 3780;
+
+        TabletRawState raw;
+        raw.in_proximity = true;
+        raw.timestamp_us = GetCurrentTimestampUs();
+
+        raw.raw_x = 108; raw.raw_y = 91;
+        auto tl = proc.Process(raw, cfg, caps);
+        t.check(std::abs(tl.normalized_x) < 1e-9, L"Physical top-left maps to 0.0 in X");
+        t.check(std::abs(tl.normalized_y) < 1e-9, L"Physical top-left maps to 0.0 in Y");
+
+        proc.Reset();
+        raw.raw_x = 5001; raw.raw_y = 3780;
+        raw.timestamp_us = GetCurrentTimestampUs();
+        auto br = proc.Process(raw, cfg, caps);
+        t.check(std::abs(br.normalized_x - 1.0) < 1e-9, L"Physical bottom-right maps to 1.0 in X");
+        t.check(std::abs(br.normalized_y - 1.0) < 1e-9, L"Physical bottom-right maps to 1.0 in Y");
+
+        proc.Reset();
+        raw.raw_x = (108 + 5001) / 2; raw.raw_y = (91 + 3780) / 2;
+        raw.timestamp_us = GetCurrentTimestampUs();
+        auto mid = proc.Process(raw, cfg, caps);
+        t.check(std::abs(mid.normalized_x - 0.5) < 1e-3, L"Surface centre maps to 0.5 in X");
+        t.check(std::abs(mid.normalized_y - 0.5) < 1e-3, L"Surface centre maps to 0.5 in Y");
+
+        // A minimum at or above the maximum must be ignored, not divide by zero.
+        proc.Reset();
+        TabletCapabilities broken;
+        broken.min_x = 9000; broken.max_x = 5000;
+        broken.min_y = 9000; broken.max_y = 5000;
+        raw.raw_x = 2500; raw.raw_y = 2500;
+        raw.timestamp_us = GetCurrentTimestampUs();
+        auto safe = proc.Process(raw, cfg, broken);
+        t.check(safe.normalized_x >= 0.0 && safe.normalized_x <= 1.0, L"Inverted bounds produce a sane result");
     }
 
     t.section(L"Capabilities drive normalization");
@@ -522,6 +604,8 @@ bool RunDecoderUnitTests() {
         original.bounds_source = BoundsSource::UserSet;
         original.tablet_max_x = 13918;
         original.tablet_max_y = 10206;
+        original.tablet_min_x = 108;
+        original.tablet_min_y = 91;
         original.pressure_min_threshold = 0.125;
         original.filter_beta = 0.0075;
         original.minimize_to_tray = false;
@@ -537,6 +621,7 @@ bool RunDecoderUnitTests() {
         t.check(loaded.target_monitor_index == 2, L"Monitor index survives a save/load");
         t.check(loaded.bounds_source == BoundsSource::UserSet, L"Bounds source survives a save/load");
         t.check(loaded.tablet_max_x == 13918 && loaded.tablet_max_y == 10206, L"Tablet bounds survive a save/load");
+        t.check(loaded.tablet_min_x == 108 && loaded.tablet_min_y == 91, L"Tablet origin survives a save/load");
         t.check(std::abs(loaded.pressure_min_threshold - 0.125) < 1e-9, L"Deadzone survives a save/load");
         t.check(std::abs(loaded.filter_beta - 0.0075) < 1e-9, L"Filter beta survives a save/load");
         t.check(loaded.minimize_to_tray == false, L"Close-to-tray survives a save/load");
@@ -585,6 +670,285 @@ bool RunDecoderUnitTests() {
     return t.failed == 0;
 }
 
+// Read-only mapping trace. Opens the tablet, decodes and maps exactly as the
+// driver would, and prints what it sees - but never injects, so the cursor
+// stays put while you touch the corners.
+void RunTrace(int seconds) {
+    const DriverConfig cfg = ConfigManager::LoadConfig();
+
+    out << L"\n=== Configuration in effect ===\n";
+    out << L"  Config file:      " << ConfigManager::GetConfigPath() << L"\n";
+    out << L"  Portable mode:    " << (ConfigManager::IsPortableMode()
+                                       ? L"ON (portable.txt present)" : L"off") << L"\n";
+    out << L"  tablet range:     X " << cfg.tablet_min_x << L".." << cfg.tablet_max_x
+        << L"   Y " << cfg.tablet_min_y << L".." << cfg.tablet_max_y << L"\n";
+    out << L"  bounds_source:    " << static_cast<int>(cfg.bounds_source)
+        << (cfg.bounds_source == BoundsSource::UserSet ? L"  (UserSet)"
+            : cfg.bounds_source == BoundsSource::Detected ? L"  (Detected)" : L"  (Default)") << L"\n";
+    out << L"  auto_detect:      " << (cfg.auto_detect_bounds ? L"ON" : L"off") << L"\n";
+    out << L"  mapping_mode:     " << static_cast<int>(cfg.mapping_mode) << L"\n";
+    out << L"  lock_aspect:      " << (cfg.lock_aspect_ratio ? L"ON" : L"off") << L"\n";
+    out << L"  active area:      " << cfg.tablet_area_left << L"," << cfg.tablet_area_top
+        << L" -> " << cfg.tablet_area_right << L"," << cfg.tablet_area_bottom << L"\n";
+    out << L"  custom rect:      " << cfg.custom_screen_rect.left << L"," << cfg.custom_screen_rect.top
+        << L" -> " << cfg.custom_screen_rect.right << L"," << cfg.custom_screen_rect.bottom << L"\n";
+
+    CoordinateMapper mapper;
+    const RECT vd = mapper.GetVirtualDesktopBounds();
+    const RECT target = mapper.GetTargetScreenBounds(cfg);
+    out << L"  virtual desktop:  " << vd.left << L"," << vd.top << L" -> " << vd.right << L"," << vd.bottom << L"\n";
+    out << L"  MAPS ONTO:        " << target.left << L"," << target.top << L" -> "
+        << target.right << L"," << target.bottom
+        << L"   (" << (target.right - target.left) << L" x " << (target.bottom - target.top) << L")\n";
+
+    PacketDecoder decoder;
+    decoder.SetAutoDetectBounds(cfg.auto_detect_bounds);
+
+    // Exactly what SignalProcessor will divide by.
+    TabletCapabilities caps = decoder.GetCapabilities();
+    if (cfg.bounds_source == BoundsSource::UserSet) {
+        if (cfg.tablet_max_x >= MIN_SANE_TABLET_BOUND) caps.max_x = cfg.tablet_max_x;
+        if (cfg.tablet_max_y >= MIN_SANE_TABLET_BOUND) caps.max_y = cfg.tablet_max_y;
+        if (cfg.tablet_min_x < caps.max_x)             caps.min_x = cfg.tablet_min_x;
+        if (cfg.tablet_min_y < caps.max_y)             caps.min_y = cfg.tablet_min_y;
+    }
+    if (cfg.auto_detect_bounds && cfg.bounds_source != BoundsSource::UserSet) {
+        const uint32_t seen_x = decoder.GetObservedMaxX();
+        const uint32_t seen_y = decoder.GetObservedMaxY();
+        if (seen_x > 0) caps.max_x = std::max(caps.max_x, seen_x);
+        if (seen_y > 0) caps.max_y = std::max(caps.max_y, seen_y);
+    }
+    out << L"  EFFECTIVE BOUNDS: X " << caps.min_x << L".." << caps.max_x
+        << L"   Y " << caps.min_y << L".." << caps.max_y;
+    if (caps.max_x != cfg.tablet_max_x || caps.max_y != cfg.tablet_max_y) {
+        out << L"   <-- differs from tablet_max above";
+    }
+    out << L"\n\n";
+
+    DiscoveredDevice dev;
+    if (!DeviceEnumerator::FindFirstSupportedTablet(dev)) {
+        out << L"[-] No supported tablet found.\n";
+        return;
+    }
+
+    HidDevice hid;
+    if (!hid.Open(dev)) {
+        out << L"[-] Could not open " << dev.product_name << L": " << GetLastError() << L"\n";
+        return;
+    }
+
+    SignalProcessor processor;
+    DriverConfig trace_cfg = cfg;
+    trace_cfg.enable_smoothing = false;   // raw truth, no filter lag
+
+    uint32_t min_x = 0xFFFFFFFF, min_y = 0xFFFFFFFF, max_x = 0, max_y = 0;
+    int32_t max_p = 0;
+    int taps = 0;
+    bool prev_contact = false;
+    auto last_print = std::chrono::steady_clock::now();
+
+    hid.SetPacketCallback([&](const uint8_t* buf, size_t len) {
+        TabletRawState raw;
+        if (!decoder.DecodePacket(buf, len, raw)) {
+            out << L"[undecoded] " << ToHex(buf, len) << L"\n" << std::flush;
+            return;
+        }
+        if (!raw.in_proximity) { prev_contact = false; return; }
+
+        min_x = std::min(min_x, raw.raw_x);  max_x = std::max(max_x, raw.raw_x);
+        min_y = std::min(min_y, raw.raw_y);  max_y = std::max(max_y, raw.raw_y);
+        max_p = std::max(max_p, raw.raw_pressure);
+
+        auto processed = processor.Process(raw, trace_cfg, caps);
+        int32_t sx = 0, sy = 0;
+        mapper.MapToScreen(processed.normalized_x, processed.normalized_y, trace_cfg, caps, sx, sy);
+
+        const bool is_tap = processed.is_contact && !prev_contact;
+        const auto now = std::chrono::steady_clock::now();
+        const bool due = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_print).count() > 120;
+        prev_contact = processed.is_contact;
+        if (!is_tap && !due) return;
+        last_print = now;
+
+        out << (is_tap ? L">> TAP  " : L"        ")
+            << L"raw(" << std::setw(5) << raw.raw_x << L"," << std::setw(5) << raw.raw_y << L")"
+            << L"  norm(" << std::fixed << std::setprecision(3) << processed.normalized_x
+            << L"," << processed.normalized_y << L")"
+            << L"  screen(" << std::setw(5) << sx << L"," << std::setw(5) << sy << L")"
+            << L"  p=" << std::setw(3) << raw.raw_pressure
+            << L"\n" << std::flush;
+        if (is_tap) ++taps;
+    });
+
+    hid.StartReading();
+    out << L"[+] Tracing for " << seconds << L" seconds - NOTHING IS INJECTED, your cursor will not move.\n";
+    out << L"    Sweep the pen right around the edge of the drawing area, into all\n";
+    out << L"    four corners. Sliding finds the true extremes; tapping does not.\n\n";
+
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - start).count() < seconds) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    hid.Close();
+
+    out << L"\n=== Observed over " << taps << L" taps ===\n";
+    if (max_x == 0 && max_y == 0) {
+        out << L"  No pen data seen. Was the pen in range?\n";
+        return;
+    }
+    out << L"  raw X range:      " << min_x << L" .. " << max_x << L"\n";
+    out << L"  raw Y range:      " << min_y << L" .. " << max_y << L"\n";
+    out << L"  peak pressure:    " << max_p << L"\n";
+    out << L"  bounds used:      " << caps.max_x << L" x " << caps.max_y << L"\n";
+    const double cover_x = caps.max_x ? (100.0 * max_x / caps.max_x) : 0.0;
+    const double cover_y = caps.max_y ? (100.0 * max_y / caps.max_y) : 0.0;
+    out << L"  corner reaches:   " << std::fixed << std::setprecision(1)
+        << cover_x << L"% of X, " << cover_y << L"% of Y\n";
+    if (cover_x > 100.5 || cover_y > 100.5) {
+        out << L"  ^ the pen runs PAST the configured bounds, so the edges clamp;\n";
+        out << L"    bounds are set SMALLER than the tablet actually reports.\n";
+    } else if (cover_x < 97.0 || cover_y < 97.0) {
+        out << L"  ^ the far corner does not reach the edge of the mapped area;\n";
+        out << L"    bounds are set LARGER than the tablet reached in this sweep.\n";
+    }
+    out << L"  suggested range:  X " << min_x << L".." << max_x
+        << L"   Y " << min_y << L".." << max_y << L"\n";
+}
+
+// Low-level read probe. Deliberately bypasses HidDevice and talks to Win32
+// directly, narrating every step, so a silent "no data" can be told apart from
+// a read path that is actually broken.
+void RunProbe(int seconds) {
+    DiscoveredDevice dev;
+    if (!DeviceEnumerator::FindFirstSupportedTablet(dev)) {
+        out << L"[-] No supported tablet found.\n";
+        return;
+    }
+
+    out << L"\n=== Device ===\n";
+    out << L"  " << dev.product_name << L"  VID 0x" << std::hex << dev.vendor_id
+        << L" PID 0x" << dev.product_id << std::dec << L"\n";
+    out << L"  " << dev.device_path << L"\n";
+
+    out << L"\n=== Opening ===\n";
+    HANDLE h = CreateFileW(dev.device_path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        out << L"  GENERIC_READ failed, error " << GetLastError() << L"\n";
+        h = CreateFileW(dev.device_path.c_str(), 0,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                        OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            out << L"  zero-access open ALSO failed, error " << GetLastError() << L"\n";
+            return;
+        }
+        out << L"  opened with NO read access - ReadFile can never deliver data.\n";
+    } else {
+        out << L"  opened GENERIC_READ | FILE_FLAG_OVERLAPPED  OK\n";
+    }
+
+    DWORD report_len = 0;
+    PHIDP_PREPARSED_DATA pre = nullptr;
+    if (HidD_GetPreparsedData(h, &pre)) {
+        HIDP_CAPS caps{};
+        if (HidP_GetCaps(pre, &caps) == HIDP_STATUS_SUCCESS) {
+            report_len = caps.InputReportByteLength;
+            out << L"  UsagePage 0x" << std::hex << caps.UsagePage
+                << L"  Usage 0x" << caps.Usage << std::dec << L"\n";
+            out << L"  InputReportByteLength   = " << caps.InputReportByteLength << L"\n";
+            out << L"  OutputReportByteLength  = " << caps.OutputReportByteLength << L"\n";
+            out << L"  FeatureReportByteLength = " << caps.FeatureReportByteLength << L"\n";
+        }
+        HidD_FreePreparsedData(pre);
+    } else {
+        out << L"  HidD_GetPreparsedData failed, error " << GetLastError() << L"\n";
+    }
+
+    if (report_len == 0) report_len = 8;
+
+    // HID requires the read buffer to match the input report length exactly on
+    // some stacks; over-sizing it is a common cause of silent read failure.
+    out << L"\n=== Reading (buffer = exactly " << report_len << L" bytes) ===\n";
+    out << L"  Move or tap the pen. Heartbeats print every second either way.\n\n";
+
+    std::vector<uint8_t> buf(report_len, 0);
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    const auto start = std::chrono::steady_clock::now();
+    int reads_issued = 0, packets = 0, pend_count = 0;
+    bool io_pending = false;
+
+    while (std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - start).count() < seconds) {
+
+        if (!io_pending) {
+            ResetEvent(ov.hEvent);
+            DWORD got = 0;
+            ++reads_issued;
+            if (ReadFile(h, buf.data(), report_len, &got, &ov)) {
+                out << L"  [immediate] " << got << L" bytes: " << ToHex(buf.data(), got) << L"\n" << std::flush;
+                ++packets;
+                continue;
+            }
+            const DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                io_pending = true;
+                ++pend_count;
+            } else {
+                out << L"  [ReadFile FAILED] error " << err;
+                if (err == ERROR_INVALID_USER_BUFFER || err == 1784) out << L"  (buffer size wrong for this HID report)";
+                if (err == ERROR_ACCESS_DENIED) out << L"  (no read access)";
+                if (err == ERROR_DEVICE_NOT_CONNECTED) out << L"  (device gone)";
+                out << L"\n" << std::flush;
+                break;
+            }
+        }
+
+        const DWORD w = WaitForSingleObject(ov.hEvent, 1000);
+        if (w == WAIT_OBJECT_0) {
+            DWORD got = 0;
+            if (GetOverlappedResult(h, &ov, &got, FALSE)) {
+                io_pending = false;
+                ++packets;
+                out << L"  [packet " << packets << L"] " << got << L" bytes: "
+                    << ToHex(buf.data(), got) << L"\n" << std::flush;
+            } else {
+                const DWORD err = GetLastError();
+                out << L"  [GetOverlappedResult FAILED] error " << err << L"\n" << std::flush;
+                io_pending = false;
+                if (err != ERROR_OPERATION_ABORTED) break;
+            }
+        } else if (w == WAIT_TIMEOUT) {
+            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start).count();
+            out << L"  ... waiting  (" << secs << L"s, reads issued=" << reads_issued
+                << L", pending=" << (io_pending ? L"yes" : L"no")
+                << L", packets=" << packets << L")\n" << std::flush;
+        } else {
+            out << L"  [wait failed] " << GetLastError() << L"\n" << std::flush;
+            break;
+        }
+    }
+
+    CancelIoEx(h, &ov);
+    DWORD drained = 0;
+    GetOverlappedResult(h, &ov, &drained, TRUE);
+    CloseHandle(ov.hEvent);
+    CloseHandle(h);
+
+    out << L"\n=== Result ===\n";
+    out << L"  reads issued : " << reads_issued << L"\n";
+    out << L"  packets read : " << packets << L"\n";
+    if (packets == 0) {
+        out << L"\n  No packets. If the heartbeats above show the read staying PENDING,\n";
+        out << L"  the handle is healthy and the device simply sent nothing - meaning the\n";
+        out << L"  pen was not in range. If instead ReadFile failed, the error is printed.\n";
+    }
+}
+
 void RunHeadless() {
     out << L"[+] Starting Wacom CT-0405-U Driver in headless background mode...\n";
     TabletDriver driver;
@@ -622,6 +986,18 @@ int main(int argc, char* argv[]) {
             } catch (...) {}
         }
         RunPacketDumper(seconds);
+    } else if (arg == "--trace" || arg == "-r") {
+        int seconds = 30;
+        if (argc >= 3) {
+            try { seconds = std::clamp(std::stoi(argv[2]), 1, 600); } catch (...) {}
+        }
+        RunTrace(seconds);
+    } else if (arg == "--probe" || arg == "-b") {
+        int seconds = 20;
+        if (argc >= 3) {
+            try { seconds = std::clamp(std::stoi(argv[2]), 1, 600); } catch (...) {}
+        }
+        RunProbe(seconds);
     } else if (arg == "--test-injection" || arg == "-t") {
         RunInjectionTest();
     } else if (arg == "--test-decoder" || arg == "-u") {

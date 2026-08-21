@@ -26,15 +26,21 @@ PacketDecoder::PacketDecoder() {
 }
 
 void PacketDecoder::SetCapabilities(const TabletCapabilities& caps) {
+    // Deliberately does not touch the observed extents: those record what the
+    // hardware reported, not what we expected it to report.
     m_caps = caps;
-    m_observed_max_x = std::max(m_observed_max_x, m_caps.max_x);
-    m_observed_max_y = std::max(m_observed_max_y, m_caps.max_y);
-    m_observed_max_pressure = std::max(m_observed_max_pressure, static_cast<int32_t>(m_caps.max_pressure));
+}
+
+void PacketDecoder::ResetObservedExtents() {
+    m_observed_max_x.store(0, std::memory_order_relaxed);
+    m_observed_max_y.store(0, std::memory_order_relaxed);
+    m_observed_max_pressure.store(0, std::memory_order_relaxed);
 }
 
 void PacketDecoder::Reset() {
     m_last_state = TabletRawState{};
     m_last_state.timestamp_us = GetCurrentTimestampUs();
+    ResetObservedExtents();
 }
 
 std::string PacketDecoder::FormatHex(const uint8_t* data, size_t length) {
@@ -48,11 +54,24 @@ std::string PacketDecoder::FormatHex(const uint8_t* data, size_t length) {
 }
 
 void PacketDecoder::NoteObservedExtents(const TabletRawState& state) {
-    if (!m_auto_detect_bounds || !state.in_proximity) return;
-    if (state.raw_x > m_observed_max_x && state.raw_x <= MAX_CREDIBLE_COORD) m_observed_max_x = state.raw_x;
-    if (state.raw_y > m_observed_max_y && state.raw_y <= MAX_CREDIBLE_COORD) m_observed_max_y = state.raw_y;
-    if (state.raw_pressure > m_observed_max_pressure && state.raw_pressure <= MAX_CREDIBLE_PRESSURE) {
-        m_observed_max_pressure = state.raw_pressure;
+    if (!state.in_proximity) return;
+
+    auto raise = [](std::atomic<uint32_t>& slot, uint32_t value, uint32_t ceiling) {
+        if (value > ceiling) return;
+        uint32_t current = slot.load(std::memory_order_relaxed);
+        while (value > current && !slot.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+        }
+    };
+
+    raise(m_observed_max_x, state.raw_x, MAX_CREDIBLE_COORD);
+    raise(m_observed_max_y, state.raw_y, MAX_CREDIBLE_COORD);
+
+    if (state.raw_pressure > 0 && state.raw_pressure <= MAX_CREDIBLE_PRESSURE) {
+        int32_t current = m_observed_max_pressure.load(std::memory_order_relaxed);
+        while (state.raw_pressure > current &&
+               !m_observed_max_pressure.compare_exchange_weak(current, state.raw_pressure,
+                                                              std::memory_order_relaxed)) {
+        }
     }
 }
 

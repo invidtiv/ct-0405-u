@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Common.h"
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -27,8 +28,13 @@ public:
     const TabletCapabilities& GetCapabilities() const { return m_caps; }
     void SetCapabilities(const TabletCapabilities& caps);
 
-    void SetAutoDetectBounds(bool enable) { m_auto_detect_bounds = enable; }
-    bool GetAutoDetectBounds() const { return m_auto_detect_bounds; }
+    void SetAutoDetectBounds(bool enable) { m_auto_detect_bounds.store(enable, std::memory_order_relaxed); }
+    bool GetAutoDetectBounds() const { return m_auto_detect_bounds.load(std::memory_order_relaxed); }
+
+    // Forgets what the hardware has reported so far. Call when the device
+    // reconnects or the user re-states the bounds, so stale extents from a
+    // previous session cannot hold the mapping open.
+    void ResetObservedExtents();
 
     // Returns false when the report does not match the PenPartner protocol.
     // Callers must not treat an undecoded packet as pen movement.
@@ -41,11 +47,13 @@ public:
 
     static std::string FormatHex(const uint8_t* data, size_t length);
 
-    // Largest coordinates/pressure actually seen from the hardware. Consumed by
-    // TabletDriver when "auto-expand bounds" is enabled.
-    uint32_t GetObservedMaxX() const { return m_observed_max_x; }
-    uint32_t GetObservedMaxY() const { return m_observed_max_y; }
-    int32_t GetObservedMaxPressure() const { return m_observed_max_pressure; }
+    // Largest coordinates/pressure actually seen from the hardware, or zero if
+    // nothing has been seen yet. Consumed by TabletDriver when "auto-expand
+    // bounds" is enabled. Atomic because the HID thread writes them while the
+    // UI thread can read them through ResolveEffectiveCaps.
+    uint32_t GetObservedMaxX() const { return m_observed_max_x.load(std::memory_order_relaxed); }
+    uint32_t GetObservedMaxY() const { return m_observed_max_y.load(std::memory_order_relaxed); }
+    int32_t GetObservedMaxPressure() const { return m_observed_max_pressure.load(std::memory_order_relaxed); }
 
 private:
     bool DecodePenPartnerReport(const uint8_t* data, size_t length, TabletRawState& out_state);
@@ -55,10 +63,13 @@ private:
     TabletCapabilities m_caps;
     TabletRawState m_last_state;
 
-    bool m_auto_detect_bounds = true;
-    uint32_t m_observed_max_x = CT0405U_MAX_X;
-    uint32_t m_observed_max_y = CT0405U_MAX_Y;
-    int32_t m_observed_max_pressure = static_cast<int32_t>(CT0405U_MAX_PRESSURE);
+    std::atomic<bool> m_auto_detect_bounds{ true };
+
+    // Zero means "nothing observed yet". Seeding these with the nominal
+    // capabilities made auto-expand a floor rather than a ceiling-raiser.
+    std::atomic<uint32_t> m_observed_max_x{ 0 };
+    std::atomic<uint32_t> m_observed_max_y{ 0 };
+    std::atomic<int32_t> m_observed_max_pressure{ 0 };
 };
 
 } // namespace ct0405
