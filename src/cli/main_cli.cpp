@@ -66,6 +66,7 @@ void PrintUsage() {
     out << L"  --test-decoder, -u    Run the automated regression suite\n";
     out << L"  --trace, -r [s]       Show raw -> normalized -> screen mapping (no injection)\n";
     out << L"  --probe, -b [s]       Narrate the low-level HID read path (diagnostic)\n";
+    out << L"  --inject-check, -i    Measure the coordinate space Windows Ink injection uses\n";
     out << L"  --headless, -s        Run driver in headless background console mode\n";
     out << L"  --help, -h            Show this help message\n";
     out << L"========================================================\n";
@@ -949,6 +950,144 @@ void RunProbe(int seconds) {
     }
 }
 
+// Measures the coordinate space InjectSyntheticPointerInput actually uses.
+// Injects a hovering pen at known screen points and reads back where Windows
+// put the cursor. Talks to user32 directly so the result describes the API,
+// not our wrapper around it.
+void RunInjectCheck() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    auto pCreate = reinterpret_cast<PFN_CreateSyntheticPointerDevice>(
+        reinterpret_cast<void*>(GetProcAddress(user32, "CreateSyntheticPointerDevice")));
+    auto pInject = reinterpret_cast<PFN_InjectSyntheticPointerInput>(
+        reinterpret_cast<void*>(GetProcAddress(user32, "InjectSyntheticPointerInput")));
+    auto pDestroy = reinterpret_cast<PFN_DestroySyntheticPointerDevice>(
+        reinterpret_cast<void*>(GetProcAddress(user32, "DestroySyntheticPointerDevice")));
+
+    if (!pCreate || !pInject) {
+        out << L"[-] Synthetic pointer API unavailable on this system.\n";
+        return;
+    }
+
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    out << L"\n=== Virtual desktop ===\n";
+    out << L"  origin " << vx << L"," << vy << L"   size " << vw << L"x" << vh << L"\n";
+    out << L"  primary " << GetSystemMetrics(SM_CXSCREEN) << L"x" << GetSystemMetrics(SM_CYSCREEN) << L"\n";
+
+    HSYNTHETICPOINTERDEVICE dev = pCreate(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT);
+    if (!dev) {
+        out << L"[-] CreateSyntheticPointerDevice failed: " << GetLastError() << L"\n";
+        return;
+    }
+
+    // Hover only - POINTER_FLAG_INRANGE without INCONTACT, so nothing draws.
+    auto hover_at = [&](int px, int py) -> POINT {
+        POINTER_TYPE_INFO info{};
+        info.type = PT_PEN;
+        POINTER_INFO& pi = info.penInfo.pointerInfo;
+        pi.pointerType = PT_PEN;
+        pi.pointerId = 0;
+        pi.ptPixelLocation.x = px;
+        pi.ptPixelLocation.y = py;
+        pi.ptPixelLocationRaw = pi.ptPixelLocation;
+        pi.historyCount = 1;
+        pi.pointerFlags = POINTER_FLAG_PRIMARY | POINTER_FLAG_CONFIDENCE |
+                          POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE;
+        info.penInfo.penMask = PEN_MASK_PRESSURE;
+        info.penInfo.pressure = 0;
+
+        pInject(dev, &info, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(140));
+
+        POINT got{ 0, 0 };
+        GetCursorPos(&got);
+        return got;
+    };
+
+    struct Probe { const wchar_t* label; int x; int y; };
+    const Probe probes[] = {
+        { L"primary centre",     960,  540 },
+        { L"primary near-top",   960,  100 },
+        { L"primary near-bottom",960, 1000 },
+        { L"primary left edge",   40,  540 },
+    };
+
+    // Pass 1: raw screen coordinates, as the API documentation implies.
+    out << L"\n=== Pass 1: injecting RAW screen coordinates ===\n";
+    out << L"  (asked)      ->  (cursor landed)   delta\n";
+
+    int matches_origin = 0, matches_exact = 0, moved = 0;
+    POINT previous{ -999999, -999999 };
+    for (const auto& pr : probes) {
+        const POINT got = hover_at(pr.x, pr.y);
+        const int dx = got.x - pr.x;
+        const int dy = got.y - pr.y;
+
+        // A probe that left the cursor exactly where the last one did tells us
+        // nothing; counting it would skew the verdict.
+        const bool stalled = (got.x == previous.x && got.y == previous.y);
+        previous = got;
+        if (!stalled) ++moved;
+        if (!stalled && std::abs(dx - vx) <= 3 && std::abs(dy - vy) <= 3) ++matches_origin;
+        if (!stalled && std::abs(dx) <= 3 && std::abs(dy) <= 3) ++matches_exact;
+
+        out << L"  " << std::setw(18) << pr.label
+            << L"  (" << std::setw(5) << pr.x << L"," << std::setw(5) << pr.y << L")"
+            << L"  -> (" << std::setw(5) << got.x << L"," << std::setw(5) << got.y << L")"
+            << L"   delta (" << std::setw(5) << dx << L"," << std::setw(5) << dy << L")"
+            << (stalled ? L"   [no movement - ignored]" : L"")
+            << L"\n" << std::flush;
+    }
+
+    // Pass 2: the same points with the virtual-desktop origin subtracted.
+    out << L"\n=== Pass 2: injecting VIRTUAL-DESKTOP-RELATIVE coordinates ===\n";
+    out << L"  (want)       ->  (cursor landed)   error\n";
+
+    int corrected_ok = 0, corrected_moved = 0;
+    previous = POINT{ -999999, -999999 };
+    for (const auto& pr : probes) {
+        const POINT got = hover_at(pr.x - vx, pr.y - vy);
+        const int ex = got.x - pr.x;
+        const int ey = got.y - pr.y;
+        const bool stalled = (got.x == previous.x && got.y == previous.y);
+        previous = got;
+        if (!stalled) ++corrected_moved;
+        if (!stalled && std::abs(ex) <= 3 && std::abs(ey) <= 3) ++corrected_ok;
+
+        out << L"  " << std::setw(18) << pr.label
+            << L"  (" << std::setw(5) << pr.x << L"," << std::setw(5) << pr.y << L")"
+            << L"  -> (" << std::setw(5) << got.x << L"," << std::setw(5) << got.y << L")"
+            << L"   error (" << std::setw(5) << ex << L"," << std::setw(5) << ey << L")"
+            << (stalled ? L"   [no movement - ignored]" : L"")
+            << L"\n" << std::flush;
+    }
+
+    if (pDestroy) pDestroy(dev);
+
+    out << L"\n=== Verdict ===\n";
+    out << L"  virtual origin: (" << vx << L", " << vy << L")\n";
+    out << L"  raw pass:       " << matches_exact << L"/" << moved << L" landed on target, "
+        << matches_origin << L"/" << moved << L" off by exactly the origin\n";
+    out << L"  corrected pass: " << corrected_ok << L"/" << corrected_moved << L" landed on target\n\n";
+
+    if (moved > 0 && matches_exact == moved) {
+        out << L"  ptPixelLocation is ABSOLUTE screen coordinates - no correction needed.\n";
+    } else if (moved > 0 && matches_origin >= (moved + 1) / 2) {
+        out << L"  ptPixelLocation is interpreted RELATIVE to the virtual desktop.\n";
+        out << L"  Absolute screen coordinates must have the origin subtracted before\n";
+        out << L"  injection, which is what pass 2 does";
+        out << ((corrected_moved > 0 && corrected_ok == corrected_moved)
+                ? L" - and it lands exactly on target.\n"
+                : L".\n");
+    } else {
+        out << L"  Inconclusive. A cursor that never moves can also mean pen hover does\n";
+        out << L"  not drive the system cursor on this machine.\n";
+    }
+}
+
 void RunHeadless() {
     out << L"[+] Starting Wacom CT-0405-U Driver in headless background mode...\n";
     TabletDriver driver;
@@ -998,6 +1137,8 @@ int main(int argc, char* argv[]) {
             try { seconds = std::clamp(std::stoi(argv[2]), 1, 600); } catch (...) {}
         }
         RunProbe(seconds);
+    } else if (arg == "--inject-check" || arg == "-i") {
+        RunInjectCheck();
     } else if (arg == "--test-injection" || arg == "-t") {
         RunInjectionTest();
     } else if (arg == "--test-decoder" || arg == "-u") {

@@ -30,6 +30,19 @@ TipBehaviour ResolveTipBehaviour(ButtonAction action) {
 
 } // namespace
 
+POINT InputInjector::ToInjectionSpace(int32_t screen_x, int32_t screen_y) {
+    // Measured on hardware: with a virtual desktop origin of (0,-541), a
+    // pointer injected at screen y=540 landed at y=-1 - offset by exactly the
+    // origin. On a single-monitor desktop the origin is (0,0), so absolute and
+    // virtual-relative coordinates coincide and the bug is invisible; it only
+    // appears once a display sits above or to the left of the primary.
+    POINT pt{
+        screen_x - GetSystemMetrics(SM_XVIRTUALSCREEN),
+        screen_y - GetSystemMetrics(SM_YVIRTUALSCREEN)
+    };
+    return pt;
+}
+
 InputInjector::InputInjector() {
     // Dynamically load user32.dll synthetic pointer functions
     HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
@@ -227,8 +240,7 @@ void InputInjector::InjectWindowsInkLocked(const TabletProcessedState& state, co
     POINTER_INFO& pi = pointerInfo.penInfo.pointerInfo;
     pi.pointerType = PT_PEN;
     pi.pointerId = 0;
-    pi.ptPixelLocation.x = state.screen_x;
-    pi.ptPixelLocation.y = state.screen_y;
+    pi.ptPixelLocation = ToInjectionSpace(state.screen_x, state.screen_y);
     pi.ptPixelLocationRaw = pi.ptPixelLocation;
     pi.historyCount = 1;
 
@@ -302,8 +314,7 @@ void InputInjector::ReleaseAllLocked() {
         POINTER_INFO& pi = pointerInfo.penInfo.pointerInfo;
         pi.pointerType = PT_PEN;
         pi.pointerId = 0;
-        pi.ptPixelLocation.x = m_last_x;
-        pi.ptPixelLocation.y = m_last_y;
+        pi.ptPixelLocation = ToInjectionSpace(m_last_x, m_last_y);
         pi.ptPixelLocationRaw = pi.ptPixelLocation;
         pi.historyCount = 1;
         pi.pointerFlags = POINTER_FLAG_PRIMARY | POINTER_FLAG_CONFIDENCE |

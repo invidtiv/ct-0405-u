@@ -210,6 +210,19 @@ map to. It finishes with the observed range and how much of the configured
 bounds the pen actually reached. **Sweep the pen around the rim** while it runs -
 sliding finds the true extremes, tapping does not.
 
+```cmd
+:: Check the coordinate space Windows Ink injection actually uses
+.uildin\Release\CT0405_CLI.exe --inject-check
+```
+
+`--inject-check` hovers a synthetic pen at known screen coordinates and reports
+where Windows put it. It exists because `InjectSyntheticPointerInput` places the
+pointer **relative to the virtual desktop origin**, not in absolute screen
+coordinates - invisible on a single monitor, where that origin is `0,0`, but a
+real offset once a display sits above or to the left of the primary. Reading the
+position back is unreliable (Windows coalesces synthetic hovers), so judge it by
+the probes that actually moved.
+
 `--probe` bypasses the driver entirely and talks to Win32 directly, reporting the
 result of every `ReadFile` with a heartbeat each second. Use it to tell "the pen
 sent nothing" apart from "the read path is broken": a healthy idle device shows
