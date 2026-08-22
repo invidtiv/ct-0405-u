@@ -68,6 +68,11 @@ private:
     void SetHeldButton(uint32_t bit, bool down);
     void SendKeyChord(WORD modifier, WORD key);
 
+    // InjectSyntheticPointerInput places the pointer relative to the virtual
+    // desktop origin rather than in absolute screen coordinates. Converts one
+    // to the other.
+    static POINT ToInjectionSpace(int32_t screen_x, int32_t screen_y);
+
     mutable std::mutex m_mutex;   // guards the synthetic device and all prev-state
 
     HSYNTHETICPOINTERDEVICE m_synthetic_device = nullptr;
